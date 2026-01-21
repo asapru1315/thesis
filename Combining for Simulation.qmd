@@ -1,0 +1,2341 @@
+---
+title: "Combining for Simulation"
+format: html
+editor: visual
+---
+
+```{r load-packages, message = FALSE}
+
+library(tidyverse)
+library(airportr)
+library(gganimate)
+library(ggimage)
+library(maps)
+library(gifski)
+library(geosphere)
+library(httr)
+library(jsonlite)
+library(fuzzyjoin)
+library(rvest)
+library(lutz)
+library(hms)
+library(mgcv)
+library(slider)
+library(mapproj)
+```
+
+### Why Care?
+
+The country’s air transportation is highly interconnected, but thus vulnerable to disruptions. These disruptions lead to delays that expand across the network and affect airlines, airports, and passengers in complex ways. Each day, the United States has 2 million enplanements—which means the impact of even small disturbances can be widespread.
+
+This project aims to build a simulation that can model such disruptions at scale, thinking from a point of view of of robustness, recovery, and systemic impacts—with a final goal of understanding what airport as a hub can help mitigate some of these issues.
+
+Air traffic disruptions have been studied using network theory, agent-based modeling, and operational research. These have shown that disruptions can cascade rapidly. Airlines, airports, and passengers all make interdependent decisions during disruptions, which makes modeling challenging. Existing data sources provide partial insights into these, but using more data and creating a clearer way to simulate is a research gap that can be filled and further used to expand the field of research in aviation.
+
+### Data
+
+Data was built in a few ways. The OpenSky data can be pulled to give last locations of current flights. Can also use Trino to pull previous flights. Original creation of the thinking behind the simulation was done with synthetic data. The decision on less accurate data came from the cost of real scheduling data.
+
+### General Data Cleaning
+
+```{r commercial-airports}
+
+# Getting Commercial Airports for Simulation
+us_airports <- 
+  readr::read_csv("https://davidmegginson.github.io/ourairports-data/airports.csv") |>
+  filter(
+    iso_country == "US",
+    scheduled_service == "yes",
+    type %in% c("large_airport", "medium_airport"),
+    !is.na(ident)
+  ) |>
+  transmute(
+    airport_name = name,
+    ICAO = stringr::str_to_upper(stringr::str_trim(ident)),
+    IATA = stringr::str_to_upper(stringr::str_trim(iata_code)),
+    latitude_deg, longitude_deg
+  )
+```
+
+After pulling from OpenSky, I needed to do some cleaning of the data. First was making sure the airports were correct. Since OpenSky uses the transponder location instead of the schedule data. Some replacement of airports needed to be done and I only used airports from OurAirports that were sized as large or medium with scheduled service—after checking the small airports and determining to not be relevant airports for the airlines being used.
+
+```{r}
+
+us_states <- map_data("state")
+
+us_airports |>
+  filter(latitude_deg > 24 & latitude_deg < 50, longitude_deg > -125 & longitude_deg < -66) |>
+  ggplot() +
+  geom_polygon(data = us_states, aes(x = long, y = lat, group = group), 
+               fill = "gray90", color = "white") +
+  geom_point(aes(x = longitude_deg, y = latitude_deg), 
+             size = 1.5) +
+  coord_map() + 
+  theme_void() +
+  labs(title = "Scheduled Service Airports (US Lower 48)")
+
+us_airports <- us_airports |>
+  select(-latitude_deg, -longitude_deg)
+```
+
+```{r load-data, warning = FALSE}
+
+path <- "opensky_daily_exports"
+
+csv_files <- list.files(path, pattern = "\\.csv$", full.names = TRUE)
+
+data_list <- lapply(csv_files, read.csv)
+
+all_data <- do.call(rbind, data_list)
+```
+
+```{r remove-twin-aisles}
+
+planes <- 
+  read_csv("https://s3.opensky-network.org/data-samples/metadata/aircraft-database-complete-2025-02.csv") |>
+  filter(`'icao24'` %in% all_data$icao24)
+
+twin_aisle_check <- all_data |>
+  filter(!icao24 %in% planes$`'icao24'`)
+
+twin_aisles <- planes |>
+  filter(str_detect(`'model'`, str_c(c("767", "777", "787", "A330", "A350", "310R", "A310"), collapse = "|")))
+
+MAX_RANGE_NM <- 3500
+
+twin_aisle_flights <- twin_aisle_check |>
+  left_join(
+    airportr::airports |>
+      dplyr::select(ICAO, Latitude, Longitude) |>
+      rename(lat = Latitude, lon = Longitude) |>
+      rename(dep_latitude = lat, dep_longitude = lon), 
+    by = c("departure" = "ICAO")
+    ) |>
+  left_join(
+    airportr::airports |>
+      dplyr::select(ICAO, Latitude, Longitude) |>
+      rename(lat = Latitude, lon = Longitude) |>
+      rename(arr_latitude = lat, arr_longitude = lon), 
+    by = c("arrival" = "ICAO")
+    ) |>
+  mutate(
+    distance_m = geosphere::distHaversine(
+      cbind(dep_longitude, dep_latitude), 
+      cbind(arr_longitude, arr_latitude)), 
+    distance_nm = distance_m / 1852
+    ) |>
+  group_by(icao24) |>
+  summarize(over_range = any(distance_m > MAX_RANGE_NM * 1852, na.rm = TRUE), .groups = "drop") |>
+  filter(over_range) |>
+  pull(icao24)
+```
+
+I removed twin aisle jets from the data of airplanes, seeing as most of them do travel outside the contiguous United States and the analysis was focused on this area. OpenSky supplies a Complete Aircraft Database that allowed for checking the hexadecimal codes for airplanes to their ownership and type. For other planes not in this data set, a check of if they completed a flight during the period which was over 3500 nautical miles (the current longest single aisle jet flight operated by US airlines—EWR to ARN by United Airlines is just under this threshold).
+
+```{r}
+
+all_twin_ids <- unique(c(twin_aisles$`'icao24'`, twin_aisle_flights))
+
+# 2. Filter data and join coordinates
+map_data <- all_data |>
+  filter(icao24 %in% all_twin_ids) |>
+  # Join Departure Coords
+  left_join(
+    airportr::airports |> select(ICAO, dep_lat = Latitude, dep_lon = Longitude),
+    by = c("departure" = "ICAO")
+  ) |>
+  # Join Arrival Coords
+  left_join(
+    airportr::airports |> select(ICAO, arr_lat = Latitude, arr_lon = Longitude),
+    by = c("arrival" = "ICAO")
+  ) |>
+  # REMOVE NAs AND IDENTICAL POINTS (This fixes the error)
+  filter(
+    !is.na(dep_lat), !is.na(dep_lon), !is.na(arr_lat), !is.na(arr_lon),
+    !(dep_lat == arr_lat & dep_lon == arr_lon) 
+  )
+
+# 3. Plot the map
+world_map <- map_data("world")
+
+ggplot() +
+  # Background World Map (Updated 'size' to 'linewidth')
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group), 
+               fill = "gray90", color = "white", linewidth = 0.2) +
+  # Flight paths
+  geom_curve(data = map_data, 
+             aes(x = dep_lon, y = dep_lat, xend = arr_lon, yend = arr_lat),
+             alpha = 0.2, linewidth = 0.2, curvature = 0.2) +
+  coord_fixed(1.3) +
+  theme_void() +
+  labs(
+    title = "Routes Flown by Twin Aisle",
+    subtitle = paste("Total flights:", nrow(map_data))
+  )
+
+map_data <- all_data |>
+  filter(icao24 %in% all_twin_ids) |>
+  left_join(
+    airportr::airports |> select(ICAO, dep_lat = Latitude, dep_lon = Longitude),
+    by = c("departure" = "ICAO")
+  ) |>
+  left_join(
+    airportr::airports |> select(ICAO, arr_lat = Latitude, arr_lon = Longitude),
+    by = c("arrival" = "ICAO")
+  ) |>
+  filter(
+    !is.na(dep_lat), !is.na(dep_lon), !is.na(arr_lat), !is.na(arr_lon),
+    !(dep_lat == arr_lat & dep_lon == arr_lon),
+    # US Mainland Bounding Box Filters
+    dep_lon > -126, dep_lon < -66, dep_lat > 24, dep_lat < 50,
+    arr_lon > -126, arr_lon < -66, arr_lat > 24, arr_lat < 50
+  )
+
+ggplot() +
+  # US States Background
+  geom_polygon(data = us_states, aes(x = long, y = lat, group = group), 
+               fill = "gray95", color = "white", linewidth = 0.2) +
+  # Flight paths
+  geom_curve(data = map_data, 
+             aes(x = dep_lon, y = dep_lat, xend = arr_lon, yend = arr_lat),
+             alpha = 0.3, linewidth = 0.4, curvature = 0.2) +
+  coord_fixed(1.3) +
+  theme_void() +
+  labs(
+    title = "Domestic Twin Aisle Flights",
+    subtitle = paste("Total flights:", nrow(map_data))
+  )
+
+all_data <- all_data |>
+  arrange(icao24) |>
+  filter(!icao24 %in% twin_aisle_flights & !icao24 %in% twin_aisles$`'icao24'`)
+```
+
+```{r replacing-non-commercials, message = FALSE}
+
+airport_lookup_1 <- read_csv("https://davidmegginson.github.io/ourairports-data/airports.csv") |>
+  dplyr::select("ICAO" = "ident",  "latitude" = "latitude_deg", "longitude" = "longitude_deg")
+
+download.file("https://nfdc.faa.gov/webContent/28DaySub/extra/22_Jan_2026_APT_CSV.zip", destfile = "APT_CSV.zip", mode = "wb")
+
+contents <- unzip("APT_CSV.zip", list = TRUE)
+
+unzip("APT_CSV.zip", files = contents[grepl("APT_BASE\\.csv$", contents$Name, ignore.case = TRUE), , drop = FALSE]$Name, 
+      exdir = "apt_extract")
+
+airport_lookup_2 <- read_csv(list.files("apt_extract", pattern = "APT_BASE\\.csv$", recursive = TRUE, full.names = TRUE, 
+                                        ignore.case = TRUE)[1]) |>
+  dplyr::select("ICAO" = "ARPT_ID", "latitude" = "LAT_DECIMAL", "longitude" = "LONG_DECIMAL")
+
+airport_lookups <- bind_rows(airport_lookup_1, airport_lookup_2) |>
+  distinct(ICAO, .keep_all = TRUE)
+
+commercial_coords <- airportr::airports |>
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |>
+  mutate(ICAO = str_to_upper(str_trim(ICAO))) |>
+  distinct() |>
+  semi_join(tibble(ICAO = str_to_upper(str_trim(us_airports$ICAO))), by = "ICAO") |>
+  filter(!is.na(lat), !is.na(lon))
+
+lookup_coords <- airport_lookups |>
+  transmute(from_icao = str_to_upper(str_trim(ICAO)), lat = as.numeric(latitude), lon = as.numeric(longitude)) |>
+  distinct(from_icao, .keep_all = TRUE) |>
+  filter(!is.na(from_icao), !is.na(lat), !is.na(lon))
+
+nearest_commercial <- function(lat, lon, comm_tbl, limit_meters = 40000) {
+  d_m <- geosphere::distHaversine(cbind(comm_tbl$lon, comm_tbl$lat), c(lon, lat))
+  
+  min_dist <- min(d_m)
+  i <- which.min(d_m)
+  
+  if (min_dist <= limit_meters) {
+    tibble(nearest_icao = comm_tbl$ICAO[i], dist_m = min_dist)
+  } 
+  
+  else {
+    tibble(nearest_icao = NA_character_, dist_m = min_dist)
+  }
+}
+
+closest_map_messy <- lookup_coords |>
+  mutate(nn = purrr::pmap(list(lat, lon), \(lat, lon)
+    nearest_commercial(lat, lon, commercial_coords, limit_meters = 40000)
+  )) |>
+  unnest(nn) |>
+  filter(!from_icao %in% commercial_coords$ICAO, !is.na(nearest_icao))
+```
+
+The replacement was done with a simple closest airport calculation for the non-OurAirports ICAOs. In addition to using the OurAirports, the Federal Aviation Administration’s Airport Master Record has location about some of the airfields. The longitude and latitudes were calculated to those in OurAirports, and then setting a limit to within 40 kilometers.
+
+```{r}
+
+
+# Visualization
+target_hubs <- c("KBDL", "KHVN", "KORH", "KHYA", "KEWB", "KBOS", "KBED", 
+                 "KACK", "KPVD", "KWST", "KLEB", "KMHT", "KPSM", "KBTV", 
+                 "KRUT", "KAUG", "KBGR", "KBHB", "KPQI", "KPWM", "KRKD")
+
+plot_data <- closest_map_messy |>
+  filter(nearest_icao %in% target_hubs) |>
+  rename(from_lat = lat, from_lon = lon) |>
+  
+  left_join(commercial_coords, by = c("nearest_icao" = "ICAO")) |>
+  rename(to_lat = lat, to_lon = lon)
+
+ne_state_names <- c("massachusetts", "connecticut", "rhode island", 
+                    "new hampshire", "vermont", "maine")
+ne_map_bg <- map_data("state", region = ne_state_names)
+
+ggplot() +
+  geom_polygon(data = ne_map_bg, aes(x = long, y = lat, group = group), 
+               fill = "gray95", color = "gray60") +
+  
+  geom_segment(data = plot_data, 
+               aes(x = from_lon, y = from_lat, xend = to_lon, yend = to_lat),
+               color = "steelblue", alpha = 0.4, linewidth = 0.3) +
+  
+  # Small Airports (Sources)
+  geom_point(data = plot_data, aes(x = from_lon, y = from_lat), 
+             color = "steelblue", size = 0.5, alpha = 0.6) +
+  
+  # Commercial Hubs (Destinations)
+  geom_point(data = plot_data |> distinct(nearest_icao, to_lon, to_lat), 
+             aes(x = to_lon, y = to_lat), 
+             color = "black", size = 2) +
+  coord_map() +
+  theme_void() +
+  labs(title = "Airport Catchment Areas",
+       subtitle = "Mappings to New England Airports"
+       )
+```
+
+```{r cleaning-airlines-airports}
+
+all_data <- all_data |>
+  left_join(closest_map_messy, by = c("departure" = "from_icao")) |>
+  mutate(departure = if_else(!is.na(nearest_icao), nearest_icao, departure)) |>
+  dplyr::select(-nearest_icao) |>
+  left_join(closest_map_messy, by = c("arrival" = "from_icao")) |>
+  mutate(arrival = if_else(!is.na(nearest_icao), nearest_icao, arrival))
+
+flights <- all_data |>
+  filter(
+    departure %in% us_airports$ICAO, 
+    arrival %in% us_airports$ICAO, 
+    departure != arrival,
+    str_sub(callsign, 1, 3) %in% c("AAL", "ASA", "DAL", "EDV", "FFT", "JBU", "NKS", "RPA", 
+                                   "SKW", "SWA", "UAL", "QXE", "JIA", "ENY", "PDT")) |>
+  mutate(
+    firstseen = ymd_hms(firstseen),
+    lastseen = ymd_hms(lastseen),
+    duration = as.numeric(difftime(lastseen, firstseen, units = "secs")) + 30 * 60,
+    lastseen = firstseen + duration,
+    route_from = pmin(departure, arrival),
+    route_to = pmax(departure, arrival)
+  )
+```
+
+```{r add-timezones, warning = FALSE}
+
+airports_ref <- airportr::airports |>
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |>
+  distinct()
+
+tz_lookup <- airports_ref |>
+  rowwise() |>
+  mutate(timezone = tz_lookup_coords(lat, lon, method = "fast")) |>
+  ungroup()
+
+flights <- flights |>
+  mutate(
+    firstseen = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen  = lubridate::ymd_hms(lastseen,  tz = "UTC")
+  )
+
+flights <- flights |>
+  dplyr::select(-any_of(c("departure_tz", "arrival_tz", "departure_tz.x", "departure_tz.y", "arrival_tz.x", "arrival_tz.y", 
+                          "dep_local", "arr_local", "dep_minute", "arr_minute", "dep_hour", "arr_hour")))
+
+dep_tz_tbl <- tz_lookup |>
+  dplyr::select(ICAO, departure_tz = timezone)
+
+arr_tz_tbl <- tz_lookup |>
+  dplyr::select(ICAO, arrival_tz = timezone)
+
+flights <- flights |>
+  left_join(dep_tz_tbl, by = c("departure" = "ICAO")) |>
+  left_join(arr_tz_tbl, by = c("arrival" = "ICAO")) |>
+  mutate(
+    firstseen = as.POSIXct(firstseen, tz = "UTC"),
+    lastseen  = as.POSIXct(lastseen,  tz = "UTC"),
+
+    departure_tz = departure_tz |> as.character() |> stringr::str_trim(),
+    arrival_tz   = arrival_tz   |> as.character() |> stringr::str_trim(),
+
+    departure_tz = dplyr::if_else(is.na(departure_tz) | !departure_tz %in% OlsonNames(), "UTC", departure_tz),
+    arrival_tz   = dplyr::if_else(is.na(arrival_tz)   | !arrival_tz   %in% OlsonNames(), "UTC", arrival_tz)
+  ) |>
+  group_by(departure_tz) |>
+  mutate(dep_local = lubridate::with_tz(firstseen, unique(departure_tz))) |>
+  ungroup() |>
+  group_by(arrival_tz) |>
+  mutate(arr_local = lubridate::with_tz(lastseen, unique(arrival_tz))) |>
+  ungroup() |>
+  mutate(
+    dep_minute = lubridate::hour(dep_local) * 60 + lubridate::minute(dep_local),
+    arr_minute = lubridate::hour(arr_local) * 60 + lubridate::minute(arr_local),
+    dep_hour   = lubridate::hour(dep_local),
+    arr_hour   = lubridate::hour(arr_local)
+  )
+```
+
+```{r turnaround-distribution}
+
+turnaround_times <- flights |>
+  arrange(icao24, firstseen) |>
+  group_by(icao24) |>
+  mutate(turnaround_mins = (as.numeric(firstseen) - lag(as.numeric(lastseen))) / 60) |>
+  ungroup() |>
+  filter(!is.na(turnaround_mins), turnaround_mins > 0, turnaround_mins < 120) |>
+  pull(turnaround_mins)
+
+fit <- MASS::fitdistr(turnaround_times, densfun = "gamma")
+shape_hat <- unname(fit$estimate["shape"])
+rate_hat  <- unname(fit$estimate["rate"])
+
+shape_hat
+rate_hat
+```
+
+### Hub-and-Spoke Carriers
+
+For hub and spoke airlines, some key ideas are the hubs they have, the banks they operate at airports, and destinations flown to.
+
+```{r select-hubs}
+
+target_airlines <- c("UAL", "DAL", "AAL", "ASA") 
+
+hub_map <- flights |>
+  mutate(airline = str_sub(callsign, 1, 3)) |>
+  filter(airline %in% target_airlines) |>
+  count(airline, hub = departure, name = "flight_volume") |>
+  group_by(airline) |>
+  slice_max(order_by = flight_volume, n = 12, with_ties = FALSE) |>
+  ungroup() |>
+  dplyr::select(airline, hub)
+
+own_hubs_tbl <- hub_map |>
+  distinct(airline, dest = hub) |>
+  mutate(is_own_hub = TRUE)
+
+own_hubs_tbl
+```
+
+The top 12 airports for each airlines were selected as hubs. For airlines (such as United) that did not have this many airports, the future results of the code were not affected by this overestimate.
+
+```{r add-regionals-to-mainlines, warning = FALSE}
+
+regional_flights <- flights |>
+  filter(str_detect(callsign, "^(RPA|SKW)")) |>
+  pivot_longer(
+    c(departure, arrival),
+    names_to  = "leg",
+    values_to = "airport"
+  ) |>
+  inner_join(hub_map, by = c("airport" = "hub")) |>
+  count(icao24, airline, name = "hub_hits") |>
+  group_by(icao24) |>
+  slice_max(hub_hits, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+flights <- flights |>
+  left_join(regional_flights, by = join_by(icao24)) |>
+  mutate(callsign = case_when(
+    !is.na(airline) ~ str_c(airline, str_sub(callsign, 4)),
+    str_sub(callsign, 1, 3) == "EDV" ~ str_c("DAL", str_sub(callsign, 4)),
+    str_sub(callsign, 1, 3) == "QXE" ~ str_c("ASA", str_sub(callsign, 4)),
+    str_sub(callsign, 1, 3) %in% c("JIA", "ENY", "PDT") ~ str_c("AAL", str_sub(callsign, 4)),
+    str_sub(callsign, 1, 3) %in% c("ASH", "UCA", "GJS") ~ str_c("UAL", str_sub(callsign, 4)),
+    TRUE ~ callsign
+  ),
+  airline = str_sub(callsign, 1, 3)) |>
+  dplyr::select(-hub_hits)
+```
+
+The regional airlines are a huge part of the networks that are being flown. Some of the regional airlines only fly for a single larger counterpart (Endevour for Delta or Horizon for Alaska), but the larger Republic and Skywest fly for multiple airlines. Therefore, the number of hubs that each airplane takes-off or lands at was used to determine what marketable airline each one belonged to.
+
+```{r}
+
+valid_hubs <- hub_map |>
+  distinct(airline, hub)
+
+dep_counts <- flights |>
+  mutate(
+    airline = str_sub(callsign, 1, 3),
+    dep_local = with_tz(firstseen, departure_tz),
+    dep_hour = hour(dep_local)
+  ) |>
+  count(airline, hub = departure, dep_hour, name = "y") |>
+  inner_join(valid_hubs, by = c("airline", "hub")) |>
+  complete(nesting(airline, hub), dep_hour = 0:23, fill = list(y = 0))
+
+hub_curves <- dep_counts |>
+  group_by(airline, hub) |>
+  group_map(~ {
+    fit <- gam(
+      y ~ s(dep_hour, bs = "cs", k = 10),
+      family = poisson(),
+      data = .x,
+      method = "REML"
+    )
+
+    tibble(
+      airline = .y$airline,
+      hub = .y$hub,
+      dep_hour = 0:23,
+      lambda = predict(
+        fit,
+        newdata = tibble(dep_hour = 0:23),
+        type = "response"
+      )
+    )
+  }) |>
+  bind_rows()
+
+banks_from_curve <- function(df, win = 1) {
+  df |>
+    arrange(dep_hour) |>
+    mutate(
+      lam_s = slide_dbl(lambda, mean, .before = win, .after = win, .complete = TRUE),
+      prev = lag(lam_s),
+      next_val = lead(lam_s)
+    ) |>
+    mutate(is_valley = !is.na(prev) & !is.na(next_val) & lam_s < prev & lam_s < next_val) |>
+    filter(is_valley) |>
+    transmute(cut = dep_hour)
+}
+
+cuts <- hub_curves |>
+  group_by(airline, hub) |>
+  group_modify(~ banks_from_curve(.x)) |>
+  ungroup()
+
+bank_intervals <- cuts |>
+  group_by(airline, hub) |>
+  summarise(
+    cuts = list(sort(unique(c(0, cut, 24)))),
+    .groups = "drop"
+  ) |>
+  mutate(
+    intervals = purrr::map(cuts, function(v) {
+      tibble(
+        start_hour = v[-length(v)],
+        end_hour = v[-1],
+        bank_idx = seq_along(v[-1])
+      )
+    })
+  ) |>
+  dplyr::select(-cuts) |>
+  tidyr::unnest(intervals) |>
+  mutate(bank = paste0("Bank ", bank_idx))
+
+bank_intervals
+```
+
+```{r}
+
+op_start <- 5
+op_end <- 23
+
+banks_from_curve_topk_hours <- function(curve_df, op_start = 6, op_end = 22, win = 1, min_banks = 3, max_banks = 4) {
+
+  x <- curve_df |>
+    arrange(hour) |>
+    mutate(
+      lam_s = slider::slide_dbl(lambda, mean, .before = win, .after = win, .complete = TRUE),
+      prev = lag(lam_s),
+      nextv = lead(lam_s),
+      valley = !is.na(prev) & !is.na(nextv) & lam_s < prev & lam_s < nextv,
+      depth = ((prev + nextv) / 2) - lam_s
+    )
+
+  valleys <- x |>
+    filter(valley) |>
+    arrange(desc(depth))
+
+  n_cuts <- case_when(
+    nrow(valleys) >= (max_banks - 1) ~ (max_banks - 1),
+    nrow(valleys) >= (min_banks - 1) ~ (min_banks - 1),
+    TRUE ~ NA_integer_
+  )
+
+  if (is.na(n_cuts)) {
+    cuts <- seq(op_start, op_end, length.out = min_banks + 1)
+  } 
+  
+  else {
+    cuts_mid <- valleys |>
+      slice_head(n = n_cuts) |>
+      pull(hour)
+
+    cuts <- sort(unique(c(op_start, cuts_mid, op_end)))
+
+    if (length(cuts) < (min_banks + 1)) {
+      cuts <- seq(op_start, op_end, length.out = min_banks + 1)
+    }
+  }
+
+  tibble::tibble(
+    start_hour = cuts[-length(cuts)],
+    end_hour = cuts[-1],
+    bank_idx = seq_along(cuts[-1]),
+    bank = paste0("Bank ", bank_idx),
+    start_min = start_hour * 60,
+    end_min = end_hour * 60,
+    n_banks = length(cuts) - 1
+  )
+}
+
+bank_intervals <- hub_curves |>
+  transmute(airline, hub, hour = dep_hour, lambda) |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y)
+    banks_from_curve_topk_hours(
+      .x,
+      op_start = op_start,
+      op_end = op_end,
+      win = 1,
+      min_banks = 3,
+      max_banks = 4
+    )
+  ) |>
+  ungroup()
+```
+
+```{r}
+
+valid_hubs <- hub_map |>
+  distinct(airline, hub)
+
+dep_counts <- flights |>
+  mutate(
+    airline  = str_sub(callsign, 1, 3),
+    dep_local = lubridate::with_tz(firstseen, departure_tz),
+    dep_hour = lubridate::hour(dep_local)
+  ) |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  filter(dep_hour >= op_start, dep_hour < op_end) |>
+  count(airline, hub = departure, hour = dep_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = op_start:(op_end - 1), fill = list(y = 0))
+
+arr_counts <- flights |>
+  mutate(
+    airline = str_sub(callsign, 1, 3),
+    arr_local = lubridate::with_tz(lastseen, arrival_tz),
+    arr_hour = lubridate::hour(arr_local)
+  ) |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  filter(arr_hour >= op_start, arr_hour < op_end) |>
+  count(airline, hub = arrival, hour = arr_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = op_start:(op_end - 1), fill = list(y = 0))
+
+fit_curve_window <- function(count_df) {
+  fit <- mgcv::gam(
+    y ~ s(hour, bs = "cs", k = 8),
+    family = poisson(),
+    data = count_df,
+    method = "REML"
+  )
+
+  tibble(
+    hour = sort(unique(count_df$hour)),
+    lambda = predict(fit, newdata = tibble(hour = hour), type = "response")
+  )
+}
+
+dep_curves <- dep_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) fit_curve_window(.x)) |>
+  ungroup()
+
+arr_curves <- arr_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) fit_curve_window(.x)) |>
+  ungroup()
+
+dep_bank_intervals <- dep_curves |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) banks_from_curve_topk_hours(.x, win = 1, min_banks = 3, max_banks = 4)) |>
+  ungroup()
+
+arr_bank_intervals <- arr_curves |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) banks_from_curve_topk_hours(.x, win = 1, min_banks = 3, max_banks = 4)) |>
+  ungroup()
+```
+
+```{r}
+
+tag_bank_snap <- function(df, intervals, minute_col, airport_col, bank_prefix) {
+
+  join_by <- if (airport_col == "departure") {
+    c("airline" = "airline", "departure" = "hub")
+  } 
+  
+  else if (airport_col == "arrival") {
+    c("airline" = "airline", "arrival" = "hub")
+  } 
+  
+  else {
+    stop("airport_col must be 'departure' or 'arrival'")
+  }
+
+  int_tbl <- intervals |>
+    dplyr::select(airline, hub, bank, bank_idx, start_min, end_min) |>
+    arrange(airline, hub, start_min)
+
+  df |>
+    inner_join(int_tbl, by = join_by) |>
+    group_by(across(all_of(c("icao24","firstseen","lastseen","departure","arrival", "airline", airport_col)))) |>
+    mutate(
+      m = .data[[minute_col]],
+      dist = case_when(
+        m >= start_min & m < end_min ~ 0,
+        m < start_min ~ start_min - m,
+        TRUE ~ m - (end_min - 1)
+      )
+    ) |>
+    slice_min(dist, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    transmute(
+      icao24, firstseen, lastseen, departure, arrival,
+      !!paste0(bank_prefix, "_hub")      := .data[[airport_col]],
+      !!paste0(bank_prefix, "_bank")     := bank,
+      !!paste0(bank_prefix, "_bank_idx") := bank_idx
+    )
+}
+
+key_cols <- c("icao24", "firstseen", "lastseen", "departure", "arrival")
+
+dep_tags <- flights |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  tag_bank_snap(dep_bank_intervals, minute_col = "dep_minute", 
+                airport_col = "departure", bank_prefix = "dep")
+
+arr_tags <- flights |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  tag_bank_snap(arr_bank_intervals, minute_col = "arr_minute", airport_col = "arrival", bank_prefix = "arr")
+
+flights_banked <- flights |>
+  left_join(dep_tags, by = key_cols) |>
+  left_join(arr_tags, by = key_cols)
+```
+
+```{r}
+
+mct_min <- 35
+max_ct_min <- 240
+
+min_turn <- 20
+max_turn <- 180
+
+two_leg <- flights_banked |>
+  arrange(icao24, firstseen) |>
+  group_by(icao24) |>
+  mutate(
+    next_dep = lead(departure),
+    next_arr = lead(arrival),
+    next_start = lead(firstseen),
+    turn_min = as.numeric(difftime(next_start, lastseen, units = "mins"))
+  ) |>
+  ungroup() |>
+  filter(
+    arrival == next_dep,
+    turn_min >= min_turn, turn_min <= max_turn
+  ) |>
+  mutate(
+    hub1 = departure,
+    spoke = arrival,
+    hub2 = next_arr
+  ) |>
+  inner_join(valid_hubs, by = c("airline", "hub1" = "hub")) |>
+  inner_join(valid_hubs, by = c("airline", "hub2" = "hub")) |>
+  filter(hub1 != hub2) |>
+  count(airline, hub1, spoke, hub2, name = "n") |>
+  arrange(desc(n))
+
+two_leg
+```
+
+```{r}
+
+wave_carriers <- c("DAL","AAL","ASA","UAL")
+
+valid_hubs <- hub_map |>
+  filter(airline %in% wave_carriers) |>
+  distinct(airline, hub)
+
+flights_wave <- flights |>
+  filter(airline %in% wave_carriers) |>
+  mutate(
+    dep_local = lubridate::with_tz(firstseen, departure_tz),
+    arr_local = lubridate::with_tz(lastseen,  arrival_tz),
+    dep_minute = lubridate::hour(dep_local) * 60 + lubridate::minute(dep_local),
+    arr_minute = lubridate::hour(arr_local) * 60 + lubridate::minute(arr_local),
+    dep_hour = lubridate::hour(dep_local),
+    arr_hour = lubridate::hour(arr_local),
+    dep_date = as.Date(dep_local),
+    arr_date = as.Date(arr_local)
+  )
+```
+
+```{r}
+
+fit_curve <- function(count_df) {
+  fit <- mgcv::gam(
+    y ~ s(hour, bs = "cs", k = 10),
+    family = poisson(),
+    data   = count_df,
+    method = "REML"
+  )
+  tibble(hour = 0:23, lambda = predict(fit, newdata = tibble(hour = 0:23), type = "response"))
+}
+
+dep_counts <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  count(airline, hub = departure, hour = dep_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = 0:23, fill = list(y = 0))
+
+arr_counts <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  count(airline, hub = arrival, hour = arr_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = 0:23, fill = list(y = 0))
+
+dep_banks <- dep_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) {
+    curve <- fit_curve(.x)
+    banks_from_curve_topk_hours(curve, win = 1, min_banks = 3, max_banks = 4)
+  }) |>
+  ungroup()
+
+arr_banks <- arr_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) {
+    curve <- fit_curve(.x)
+    banks_from_curve_topk_hours(curve, win = 1, min_banks = 3, max_banks = 4)
+  }) |>
+  ungroup()
+```
+
+```{r}
+
+connect_score <- function(t, arr_vec, mct = 35, max_ct = 180) {
+  t <- as.integer(t) %% 1440
+  lo <- t - max_ct
+  hi <- t - mct
+
+  rng <- seq(lo, hi)
+  rng_mod <- (rng %% 1440) + 1
+  sum(arr_vec[rng_mod])
+}
+
+optimize_slots_in_bank <- function(start_min, end_min, n_slots, arr_vec,
+                                   mct = 35, max_ct = 180,
+                                   buffer = 5, min_sep = 4,
+                                   search_radius = 30, passes = 2) {
+  if (n_slots <= 0) return(integer())
+  lo <- start_min + buffer
+  hi <- end_min   - buffer
+  if (hi <= lo) return(rep(round((start_min + end_min) / 2), n_slots))
+
+  slots <- if (n_slots == 1) {
+    round((lo + hi) / 2)
+  } else {
+    round(seq(lo, hi, length.out = n_slots))
+  }
+
+  for (p in seq_len(passes)) {
+    for (i in seq_along(slots)) {
+      left_bound  <- if (i == 1) lo else slots[i - 1] + min_sep
+      right_bound <- if (i == length(slots)) hi else slots[i + 1] - min_sep
+      if (right_bound < left_bound) next
+
+      cand_lo <- max(left_bound,  slots[i] - search_radius)
+      cand_hi <- min(right_bound, slots[i] + search_radius)
+      cands <- cand_lo:cand_hi
+
+      scores <- vapply(
+        cands,
+        \(tt) connect_score(tt, arr_vec, mct = mct, max_ct = max_ct),
+        numeric(1)
+      )
+
+      slots[i] <- cands[which.max(scores)]
+    }
+  }
+
+  slots
+}
+```
+
+```{r}
+
+hub_dep_obs <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  left_join(dep_banks |> dplyr::select(airline, hub, bank, bank_idx, start_min, end_min),
+            by = c("airline", "departure" = "hub")) |>
+  filter(!is.na(start_min), !is.na(end_min)) |>
+  filter(dep_minute >= start_min, dep_minute < end_min) |>
+  mutate(hub = departure) |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min, dep_date) |>
+  summarise(n_day = n(), .groups = "drop") |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min) |>
+  complete(
+    dep_date = seq(min(dep_date), max(dep_date), by = "day"),
+    fill = list(n_day = 0)
+  ) |>
+  summarise(
+    n_dep = as.integer(ceiling(stats::quantile(n_day, 0.90, na.rm = TRUE))),
+    .groups = "drop"
+  ) |>
+  mutate(n_dep = pmax(0L, n_dep))
+
+route_shares <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  left_join(
+    dep_banks |> dplyr::select(airline, hub, bank, bank_idx, start_min, end_min),
+    by = c("airline", "departure" = "hub")
+  ) |>
+  filter(dep_minute >= start_min, dep_minute < end_min) |>
+  mutate(hub = departure, dest = arrival) |>
+  count(airline, hub, bank, bank_idx, dest, name = "n") |>
+  left_join(own_hubs_tbl, by = c("airline", "dest")) |>
+  mutate(
+    is_own_hub = coalesce(is_own_hub, FALSE),
+    w = if_else(is_own_hub, 0.5, 1.0),   # <-- this is your “split in half”
+    n_w = n * w
+  ) |>
+  group_by(airline, hub, bank, bank_idx) |>
+  mutate(p = n_w / sum(n_w)) |>
+  ungroup()
+
+route_dist <- route_shares |>
+  group_by(airline, hub, bank, bank_idx) |>
+  summarise(dests = list(dest), probs = list(p), .groups = "drop")
+
+arr_vec_tbl <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  mutate(hub = arrival) |>
+  group_by(airline, hub) |>
+  summarise(
+    n_days = n_distinct(arr_date),
+    arr_vec = list(
+      tabulate((arr_minute %% 1440) + 1L, nbins = 1440) / pmax(1L, n_days)
+    ),
+    .groups = "drop"
+  )
+
+set.seed(1)
+
+mct_min   <- 35
+max_ct_min <- 180
+
+allocate_dests_bank <- function(n_slots, dests, probs) {
+  if (n_slots <= 0) return(character())
+  if (is.null(dests) || length(dests) == 0) return(rep(NA_character_, n_slots))
+
+  # 1. Guarantee coverage: Create a list containing ONE of every destination
+  # available in the data, regardless of probability.
+  guaranteed_deck <- dests
+  
+  # 2. Weighted fill: If we need more slots than unique destinations, 
+  # fill the rest using the probabilities (popular routes get more flights).
+  if (n_slots > length(guaranteed_deck)) {
+    remainder <- n_slots - length(guaranteed_deck)
+    
+    # normalize probs
+    probs <- as.numeric(probs)
+    probs[is.na(probs) | probs < 0] <- 0
+    if(sum(probs) > 0) probs <- probs / sum(probs)
+    
+    extra_flights <- sample(dests, size = remainder, replace = TRUE, prob = probs)
+    final_list <- c(guaranteed_deck, extra_flights)
+    
+  } else {
+    # If we have fewer slots than destinations, we must sample without replacement
+    # but we prioritize by probability to keep the major routes alive.
+    final_list <- sample(dests, size = n_slots, replace = FALSE, prob = probs)
+  }
+
+  # Shuffle so the small destinations aren't always at the end of the bank
+  sample(final_list)
+}
+
+set.seed(1)
+
+wave_schedule <- hub_dep_obs |>
+  left_join(arr_vec_tbl, by = c("airline", "hub")) |>
+  mutate(
+    slot_minute = purrr::pmap(
+      list(start_min, end_min, n_dep, arr_vec),
+      \(.s, .e, .n, .v) optimize_slots_in_bank(
+        .s, .e, .n, .v,
+        mct = mct_min, max_ct = max_ct_min,
+        buffer = 5, min_sep = 4, search_radius = 30, passes = 2
+      )
+    )
+  ) |>
+  tidyr::unnest(slot_minute) |>
+  mutate(slot_minute = as.integer(round(slot_minute))) |>
+  group_by(airline, hub, bank, bank_idx) |>
+  mutate(
+    slot_idx = row_number(),
+    connect  = vapply(
+      slot_minute,
+      \(tt) connect_score(tt, arr_vec[[1]], mct = mct_min, max_ct = max_ct_min),
+      numeric(1)
+    )
+  ) |>
+  ungroup() |>
+  left_join(route_dist, by = c("airline","hub","bank","bank_idx")) |>
+  group_by(airline, hub, bank, bank_idx) |>
+  mutate(
+    dest_vec = list(allocate_dests_bank(first(n_dep), dests[[1]], probs[[1]])),
+    dest     = dest_vec[[1]][slot_idx],
+    dep_hhmm = sprintf(
+      "%02d:%02d",
+      as.integer(slot_minute %/% 60),
+      as.integer(slot_minute %% 60)
+    )
+  ) |>
+  ungroup() |>
+  dplyr::select(-dests, -probs, -dest_vec) |>
+  arrange(airline, hub, bank_idx, slot_minute)
+```
+
+```{r}
+
+route_block <- flights_wave |>
+  mutate(dur_sec = as.numeric(difftime(lastseen, firstseen, units = "secs"))) |>
+  filter(is.finite(dur_sec), dur_sec > 10 * 60, dur_sec < 10 * 3600) |>
+  group_by(airline, departure, arrival) |>
+  summarise(
+    n = n(),
+    dur_sec_med = median(dur_sec, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+get_block_sec <- function(airline, dep, arr, route_block, fallback = 90 * 60) {
+  hit <- route_block |>
+    filter(airline == !!airline, departure == !!dep, arrival == !!arr)
+  if (nrow(hit) == 1 && hit$n >= 10 && is.finite(hit$dur_sec_med)) hit$dur_sec_med else fallback
+}
+```
+
+```{r}
+
+get_duration_safe <- function(al, dep, arr, r_block) {
+  match_row <- r_block |> 
+    filter(airline == al, departure == dep, arrival == arr)
+  
+  if(nrow(match_row) > 0) return(as.integer(match_row$dur_sec_med))
+  
+  return(as.integer(3600)) 
+}
+
+add_coords_11cols <- function(tbl, airports_ref) {
+  dep_coords <- airports_ref |> 
+    dplyr::select(ICAO, dep_latitude = lat, dep_longitude = lon) |> 
+    distinct()
+  
+  arr_coords <- airports_ref |> 
+    dplyr::select(ICAO, arr_latitude = lat, arr_longitude = lon) |> 
+    distinct()
+  
+  tbl |> 
+    left_join(dep_coords, by = c("departure" = "ICAO")) |> 
+    left_join(arr_coords, by = c("arrival" = "ICAO")) |> 
+    dplyr::select(
+      any_of(c("airline", "callsign", "tail_number", "departure", "arrival", 
+               "day_of_week", "departure_time", "arrival_time")),
+      dep_latitude, dep_longitude, arr_latitude, arr_longitude
+    )
+}
+
+base_demand <- wave_schedule |>
+  mutate(
+    dep_sec = as.integer(round(slot_minute)) * 60L,
+    airline_code = airline
+  ) |>
+  rowwise() |>
+  mutate(
+    duration_out = get_duration_safe(airline, hub, dest, route_block)
+  ) |>
+  ungroup() |>
+  transmute(
+    airline,
+    flight_id_base = paste0(airline, "-", hub, "-", bank_idx, "-", row_number()),
+    origin = hub,
+    dest = dest,
+    dep_time = dep_sec,
+    arr_time = dep_sec + duration_out
+  )
+
+min_turn_seconds <- 45 * 60 
+
+return_demand <- base_demand |>
+    rowwise() |>
+    mutate(
+      # Turn time is between 45 mins and 3 hours (randomized)
+      actual_turn = as.integer(runif(1, 45 * 60, 180 * 60)),
+      
+      origin_ret = dest, 
+      dest_ret = origin,
+      
+      # Departure is Arrival + Turn
+      dep_time_ret = arr_time + actual_turn
+    ) |>
+  rowwise() |>
+  mutate(
+    duration_in = get_duration_safe(airline, origin_ret, dest_ret, route_block)
+  ) |>
+  ungroup() |>
+  transmute(
+    airline,
+    flight_id_base = paste0(flight_id_base, "R"),
+    origin = origin_ret,
+    dest = dest_ret,
+    dep_time = dep_time_ret,
+    arr_time = dep_time_ret + duration_in
+  )
+
+master_schedule <- bind_rows(
+  base_demand |> mutate(type = "outbound"),
+  return_demand |> mutate(type = "inbound")
+) |>
+  arrange(dep_time)
+
+fleet_state <- tibble(
+  airline = character(),
+  tail_num = character(),
+  loc = character(),
+  ready_at = integer()
+)
+
+assigned_schedule <- list()
+tail_counter <- 1 
+turn_buffer_hub <- 60 * 60
+
+total_flights <- nrow(master_schedule)
+cat("Assigning aircraft to", total_flights, "flights...\n")
+pb <- txtProgressBar(min = 0, max = total_flights, style = 3)
+
+for(i in 1:total_flights) {
+  
+  flight <- master_schedule[i, ]
+
+  candidates <- fleet_state |>
+    filter(
+      airline == flight$airline,
+      loc == flight$origin,
+      ready_at <= flight$dep_time
+    ) |>
+    arrange(desc(ready_at))
+  
+  if(nrow(candidates) > 0) {
+    chosen_tail <- candidates$tail_num[1]
+    
+    fleet_state <- fleet_state |>
+      filter(tail_num != chosen_tail) |>
+      add_row(
+        airline = flight$airline,
+        tail_num = chosen_tail,
+        loc = flight$dest,
+        ready_at = flight$arr_time + turn_buffer_hub
+      )
+    
+  } else {
+    chosen_tail <- paste0("N", str_pad(tail_counter, 5, pad = "0"), flight$airline)
+    tail_counter <- tail_counter + 1
+    
+    fleet_state <- fleet_state |>
+      add_row(
+        airline = flight$airline,
+        tail_num = chosen_tail,
+        loc = flight$dest,
+        ready_at = flight$arr_time + turn_buffer_hub
+      )
+  }
+  
+  assigned_schedule[[i]] <- flight |> mutate(tail_number = chosen_tail)
+  
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+final_daily_schedule <- bind_rows(assigned_schedule)
+
+airports_ref <- airportr::airports |> 
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |> 
+  distinct()
+
+airport_tz_map <- airports_ref |> 
+  filter(!is.na(lat), !is.na(lon)) |> 
+  dplyr::select(ICAO, lat, lon) |> 
+  mutate(tz_name = lutz::tz_lookup_coords(lat, lon, method = "fast")) |> 
+  dplyr::select(ICAO, tz_name)
+
+ref_date_str <- as.character(Sys.Date()) 
+
+schedule_et <- final_daily_schedule |> 
+  left_join(airport_tz_map, by = c("origin" = "ICAO")) |> 
+  filter(!is.na(tz_name)) |> 
+  group_by(tz_name) |> 
+  mutate(
+
+    midnight_local = lubridate::ymd_hms(paste(ref_date_str, "00:00:00"), tz = tz_name[1]),
+    
+    local_dep_dt = midnight_local + seconds(dep_time),
+    
+    et_dep_dt = with_tz(local_dep_dt, "America/New_York"),
+    
+    flight_duration = arr_time - dep_time,
+    et_arr_dt = et_dep_dt + seconds(flight_duration)
+  ) |> 
+  ungroup() |> 
+  mutate(
+    dep_time_hms = as_hms(et_dep_dt),
+    arr_time_hms = as_hms(et_arr_dt),
+    day_offset = as.integer(floor(difftime(floor_date(et_dep_dt, "day"), 
+                                           as.POSIXct(ref_date_str, tz="America/New_York"), 
+                                           units = "days")))
+  )
+
+day_levels <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+full_week_schedule <- map_dfr(1:7, function(i) {
+  
+  schedule_et |> 
+    mutate(
+      current_day_idx = i,
+      final_day_idx = (current_day_idx + day_offset - 1) %% 7 + 1,
+      day_of_week = day_levels[final_day_idx],
+      callsign = paste0(airline, str_sub(tail_number, 2, 5))
+    )
+}) |> 
+  rename(
+    departure = origin,
+    arrival = dest,
+    departure_time = dep_time_hms,
+    arrival_time = arr_time_hms
+  ) |> 
+  add_coords_11cols(airports_ref = airports_ref) |> 
+  dplyr::select(
+    airline, callsign, tail_number, departure, arrival, 
+    day_of_week, departure_time, arrival_time, 
+    dep_latitude, dep_longitude, arr_latitude, arr_longitude
+  ) |> 
+  mutate(
+    duration = as.numeric(arrival_time - departure_time), 
+    day_of_week = factor(day_of_week, levels = day_levels, ordered = TRUE)
+  ) |> 
+  arrange(day_of_week, departure_time)
+
+# --- 1. PREPARE DAILY DEMAND & PROBABILITIES ---
+
+# Calculate Departure Volume per Weekday (Mon, Tue, etc.)
+hub_dep_obs_daily <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  left_join(dep_banks |> dplyr::select(airline, hub, bank, bank_idx, start_min, end_min),
+            by = c("airline", "departure" = "hub")) |>
+  filter(!is.na(start_min), !is.na(end_min)) |>
+  filter(dep_minute >= start_min, dep_minute < end_min) |>
+  mutate(
+    hub = departure,
+    # Extract Day Name (Monday, Tuesday...)
+    day_name = lubridate::wday(dep_date, label = TRUE, abbr = FALSE) 
+  ) |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min, day_name, dep_date) |>
+  summarise(n_day = n(), .groups = "drop") |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min, day_name) |>
+  summarise(
+    # Use 90th percentile to ensure we capture "busy" days properly
+    n_dep = as.integer(ceiling(stats::quantile(n_day, 0.90, na.rm = TRUE))),
+    .groups = "drop"
+  ) |>
+  mutate(n_dep = pmax(0L, n_dep))
+
+# Calculate Route Probabilities (Global - aggregated across all days for stability)
+route_shares <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  left_join(
+    dep_banks |> dplyr::select(airline, hub, bank, bank_idx, start_min, end_min),
+    by = c("airline", "departure" = "hub")
+  ) |>
+  filter(dep_minute >= start_min, dep_minute < end_min) |>
+  mutate(hub = departure, dest = arrival) |>
+  count(airline, hub, bank, bank_idx, dest, name = "n") |>
+  left_join(own_hubs_tbl, by = c("airline", "dest")) |>
+  mutate(
+    is_own_hub = coalesce(is_own_hub, FALSE),
+    w = if_else(is_own_hub, 0.5, 1.0),
+    n_w = n * w
+  ) |>
+  group_by(airline, hub, bank, bank_idx) |>
+  mutate(p = n_w / sum(n_w)) |>
+  ungroup()
+
+route_dist <- route_shares |>
+  group_by(airline, hub, bank, bank_idx) |>
+  summarise(dests = list(dest), probs = list(p), .groups = "drop")
+
+# Calculate Arrival Profiles (Global)
+arr_vec_tbl <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  mutate(hub = arrival) |>
+  group_by(airline, hub) |>
+  summarise(
+    n_days = n_distinct(arr_date),
+    arr_vec = list(
+      tabulate((arr_minute %% 1440) + 1L, nbins = 1440) / pmax(1L, n_days)
+    ),
+    .groups = "drop"
+  )
+
+# --- 2. HELPER FUNCTIONS ---
+
+set.seed(1)
+mct_min    <- 35
+max_ct_min <- 180
+
+allocate_dests_bank <- function(n_slots, dests, probs) {
+  if (n_slots <= 0) return(character())
+  if (is.null(dests) || length(dests) == 0) return(rep(NA_character_, n_slots))
+
+  probs <- as.numeric(probs)
+  probs[is.na(probs) | probs < 0] <- 0
+  if (sum(probs) <= 0) return(rep(NA_character_, n_slots))
+  probs <- probs / sum(probs)
+
+  exp_ct <- n_slots * probs
+  base   <- floor(exp_ct)
+  rem    <- n_slots - sum(base)
+  frac   <- exp_ct - base
+
+  if (rem > 0) {
+    add_idx <- order(frac, decreasing = TRUE)[seq_len(rem)]
+    base[add_idx] <- base[add_idx] + 1L
+  }
+
+  vec <- rep(dests, base)
+  sample(vec, size = n_slots, replace = FALSE)
+}
+
+get_duration_safe <- function(al, dep, arr, r_block) {
+  match_row <- r_block |> 
+    filter(airline == al, departure == dep, arrival == arr)
+  
+  if(nrow(match_row) > 0) return(as.integer(match_row$dur_sec_med))
+  return(as.integer(3600)) 
+}
+
+# Core function to generate one day of flights (unassigned tails)
+generate_daily_schedule <- function(target_day, obs_data, routes_data, arr_vec_data) {
+  
+  # Filter demand for the specific day (e.g., "Monday")
+  day_obs <- obs_data |> filter(day_name == target_day)
+  
+  if(nrow(day_obs) == 0) return(tibble())
+
+  # Optimize slots
+  day_schedule <- day_obs |>
+    left_join(arr_vec_data, by = c("airline", "hub")) |>
+    mutate(
+      slot_minute = purrr::pmap(
+        list(start_min, end_min, n_dep, arr_vec),
+        \(.s, .e, .n, .v) optimize_slots_in_bank(
+          .s, .e, .n, .v,
+          mct = mct_min, max_ct = max_ct_min,
+          buffer = 5, min_sep = 4, search_radius = 30, passes = 2
+        )
+      )
+    ) |>
+    tidyr::unnest(slot_minute) |>
+    mutate(slot_minute = as.integer(round(slot_minute))) |>
+    
+    # Check connectivity scores (optional but good for debugging)
+    group_by(airline, hub, bank, bank_idx) |>
+    mutate(
+      slot_idx = row_number(),
+      connect = vapply(slot_minute, \(tt) connect_score(tt, arr_vec[[1]]), numeric(1))
+    ) |>
+    ungroup() |>
+    
+    # Assign destinations
+    left_join(routes_data, by = c("airline","hub","bank","bank_idx")) |>
+    group_by(airline, hub, bank, bank_idx) |>
+    mutate(
+      dest_vec = list(allocate_dests_bank(first(n_dep), dests[[1]], probs[[1]])),
+      dest     = dest_vec[[1]][slot_idx]
+    ) |>
+    ungroup() |>
+    dplyr::select(-dests, -probs, -dest_vec) |>
+    filter(!is.na(dest)) 
+
+  # Calculate block times and returns
+  base_demand <- day_schedule |>
+    mutate(dep_sec = as.integer(round(slot_minute)) * 60L) |>
+    rowwise() |>
+    mutate(duration_out = get_duration_safe(airline, hub, dest, route_block)) |>
+    ungroup() |>
+    transmute(
+      airline,
+      flight_id_base = paste0(airline, "-", hub, "-", bank_idx, "-", row_number()),
+      origin = hub, dest = dest,
+      dep_time = dep_sec,
+      arr_time = dep_sec + duration_out
+    )
+
+  min_turn_seconds <- 45 * 60 
+
+  return_demand <- base_demand |>
+    mutate(
+      origin_ret = dest, dest_ret = origin,
+      dep_time_ret = arr_time + min_turn_seconds
+    ) |>
+    rowwise() |>
+    mutate(duration_in = get_duration_safe(airline, origin_ret, dest_ret, route_block)) |>
+    ungroup() |>
+    transmute(
+      airline,
+      flight_id_base = paste0(flight_id_base, "R"),
+      origin = origin_ret, dest = dest_ret,
+      dep_time = dep_time_ret,
+      arr_time = dep_time_ret + duration_in
+    )
+
+  # Combine outbound and inbound
+  bind_rows(base_demand, return_demand) |>
+    mutate(day_of_week = target_day) |>
+    arrange(dep_time)
+}
+
+# --- 3. RUN 7-DAY SIMULATION ---
+
+# Initialize empty fleet
+fleet_state <- tibble(
+  airline = character(),
+  tail_num = character(),
+  loc = character(),
+  ready_at = integer() # seconds from start of the *current* day
+)
+
+tail_counter <- 1
+turn_buffer_hub <- 45 * 60
+seconds_per_day <- 24 * 60 * 60
+
+days_to_sim <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+full_week_results <- list()
+
+cat("Starting 7-day continuous simulation...\n")
+
+for (d_idx in seq_along(days_to_sim)) {
+  current_day <- days_to_sim[d_idx]
+  cat("Simulating:", current_day, "\n")
+  
+  # A. Generate demand specific to this day of the week
+  daily_flights <- generate_daily_schedule(current_day, hub_dep_obs_daily, route_dist, arr_vec_tbl)
+  
+  # B. Reset fleet clocks for the new day
+  # If a plane was ready at 26:00 (2 AM) on Monday, it is ready at 02:00 on Tuesday
+  if (nrow(fleet_state) > 0) {
+    fleet_state <- fleet_state |>
+      mutate(ready_at = pmax(0, ready_at - seconds_per_day))
+  }
+  
+  # C. Assign tails
+  assigned_day <- list()
+  daily_flights <- daily_flights |> arrange(dep_time)
+  
+  if(nrow(daily_flights) > 0) {
+    for(i in seq_len(nrow(daily_flights))) {
+      flight <- daily_flights[i, ]
+      
+      # Look for existing aircraft
+      candidates <- fleet_state |>
+        filter(
+          airline == flight$airline,
+          loc == flight$origin,
+          ready_at <= flight$dep_time
+        ) |>
+        arrange(desc(ready_at)) 
+      
+      if(nrow(candidates) > 0) {
+        chosen_tail <- candidates$tail_num[1]
+        
+        fleet_state <- fleet_state |>
+          filter(tail_num != chosen_tail) |>
+          add_row(
+            airline  = flight$airline,
+            tail_num = chosen_tail,
+            loc      = flight$dest,
+            ready_at = flight$arr_time + turn_buffer_hub
+          )
+      } else {
+        # Create new aircraft
+        chosen_tail <- paste0("N", stringr::str_pad(tail_counter, 5, pad = "0"), flight$airline)
+        tail_counter <- tail_counter + 1
+        
+        fleet_state <- fleet_state |>
+          add_row(
+            airline  = flight$airline,
+            tail_num = chosen_tail,
+            loc      = flight$dest,
+            ready_at = flight$arr_time + turn_buffer_hub
+          )
+      }
+      
+      assigned_day[[i]] <- flight |> mutate(tail_number = chosen_tail)
+    }
+    full_week_results[[d_idx]] <- bind_rows(assigned_day)
+  }
+}
+
+final_week_schedule <- bind_rows(full_week_results)
+
+# --- 4. FORMATTING AND SAVING ---
+
+add_coords_11cols <- function(tbl, airports_ref) {
+  dep_coords <- airports_ref |> 
+    dplyr::select(ICAO, dep_latitude = lat, dep_longitude = lon) |> 
+    distinct()
+  
+  arr_coords <- airports_ref |> 
+    dplyr::select(ICAO, arr_latitude = lat, arr_longitude = lon) |> 
+    distinct()
+  
+  tbl |> 
+    left_join(dep_coords, by = c("departure" = "ICAO")) |> 
+    left_join(arr_coords, by = c("arrival" = "ICAO")) |> 
+    dplyr::select(
+      any_of(c("airline", "callsign", "tail_number", "departure", "arrival", 
+               "day_of_week", "departure_time", "arrival_time")),
+      dep_latitude, dep_longitude, arr_latitude, arr_longitude
+    )
+}
+
+airports_ref <- airportr::airports |> 
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |> 
+  distinct()
+
+final_formatted <- final_week_schedule |>
+  rename(departure = origin, arrival = dest) |>
+  mutate(
+    callsign = paste0(airline, str_sub(tail_number, 2, 5)),
+    departure_time = hms::as_hms(dep_time),
+    arrival_time = hms::as_hms(arr_time),
+    day_of_week = factor(day_of_week, levels = days_to_sim, ordered = TRUE)
+  ) |>
+  add_coords_11cols(airports_ref = airports_ref) |>
+  mutate(duration = as.numeric(arrival_time - departure_time)) |> 
+  arrange(day_of_week, departure_time)
+
+saveRDS(final_formatted, "hub_spoke_schedule.rds")
+```
+
+### Point-to-Point Carriers
+
+```{r setting-up-point-to-point}
+
+ptp_prefix <- c("FFT", "JBU", "NKS", "SWA")
+
+flights <- all_data |>
+  mutate(
+    airline = stringr::str_sub(callsign, 1, 3),
+    firstseen_utc = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen_utc = lubridate::ymd_hms(lastseen, tz = "UTC"),
+    service_date_utc = as.Date(firstseen_utc)
+  ) |>
+  filter(
+    departure %in% us_airports$ICAO,
+    arrival %in% us_airports$ICAO,
+    departure != arrival,
+    airline %in% ptp_prefix
+    ) |>
+  mutate(
+    duration_s = as.numeric(difftime(lastseen_utc, firstseen_utc, units = "secs")),
+    duration_m = duration_s / 60
+    ) |>
+  filter(is.finite(duration_m), duration_m > 0, duration_m < 24 * 60) |>
+  dplyr::select(
+    airline, callsign, icao24, departure, arrival, firstseen_utc, lastseen_utc, 
+    service_date_utc, duration_m
+  )
+
+spread_midnight_spike_utc <- function(
+  flights_tbl,
+  airlines = c("SWA","FFT","NKS","JBU"),
+  max_back_hours = 2L,
+  expected_method = c("p50_1to3", "hour1"),
+  seed = 1
+) {
+  expected_method <- match.arg(expected_method)
+  set.seed(seed)
+
+  x <- flights_tbl |>
+    mutate(
+      airline = as.character(airline),
+      firstseen_utc = as.POSIXct(firstseen_utc, tz = "UTC"),
+      lastseen_utc  = as.POSIXct(lastseen_utc,  tz = "UTC"),
+      service_date_utc = as.Date(firstseen_utc),
+      hour_utc = lubridate::hour(firstseen_utc),
+      .row_id = row_number()
+    )
+
+  hourly <- x |>
+    filter(airline %in% airlines) |>
+    count(airline, service_date_utc, hour_utc, name = "n") |>
+    tidyr::complete(airline, service_date_utc, hour_utc = 0:23, fill = list(n = 0))
+
+  expected <- hourly |>
+    group_by(airline, service_date_utc) |>
+    summarise(
+      n0 = n[hour_utc == 0],
+      n1 = n[hour_utc == 1],
+      n2 = n[hour_utc == 2],
+      n3 = n[hour_utc == 3],
+      expected0 = dplyr::case_when(
+        expected_method == "hour1"    ~ n1,
+        expected_method == "p50_1to3" ~ as.integer(stats::median(c(n1, n2, n3))),
+        TRUE ~ n1
+      ),
+      excess0 = pmax(0L, n0 - expected0),
+      .groups = "drop"
+    ) |>
+    filter(excess0 > 0)
+
+  if (nrow(expected) == 0) {
+    return(x |> dplyr::select(-hour_utc, -.row_id))
+  }
+
+  cand <- x |>
+    filter(airline %in% airlines, hour_utc == 0) |>
+    inner_join(expected |> dplyr::select(airline, service_date_utc, excess0),
+               by = c("airline", "service_date_utc"))
+
+  if (nrow(cand) == 0) {
+    return(x |> dplyr::select(-hour_utc, -.row_id))
+  }
+
+  movers <- cand |>
+    group_by(airline, service_date_utc) |>
+    group_modify(\(.df, .key) {
+      n_move <- min(nrow(.df), .df$excess0[[1]])
+      if (n_move <= 0) return(.df[0, ])
+      dplyr::slice_sample(.df, n = n_move)
+    }) |>
+    ungroup() |>
+    dplyr::select(.row_id)
+
+  if (nrow(movers) == 0) {
+    return(x |> dplyr::select(-hour_utc, -.row_id))
+  }
+
+  ks <- 1L:max_back_hours
+  probs <- rev(seq_len(max_back_hours))
+  probs <- probs / sum(probs)
+
+  shift_tbl <- movers |>
+    mutate(k = sample(ks, size = n(), replace = TRUE, prob = probs))
+
+  out <- x |>
+    left_join(shift_tbl, by = ".row_id") |>
+    mutate(
+      firstseen_utc = if_else(!is.na(k), firstseen_utc - lubridate::hours(k), firstseen_utc),
+      lastseen_utc  = if_else(!is.na(k), lastseen_utc  - lubridate::hours(k), lastseen_utc),
+      service_date_utc = as.Date(firstseen_utc)
+    ) |>
+    dplyr::select(-hour_utc, -.row_id, -k)
+
+  out
+}
+
+flights <- spread_midnight_spike_utc(
+  flights,
+  airlines = ptp_prefix,
+  max_back_hours = 2,
+  expected_method = "p50_1to3",
+  seed = 1
+)
+
+airports_ref <- airportr::airports |>
+  transmute(
+    ICAO = stringr::str_to_upper(stringr::str_trim(ICAO)),
+    lat  = Latitude,
+    lon  = Longitude
+  ) |>
+  distinct() |>
+  filter(!is.na(lat), !is.na(lon))
+
+tz_lookup <- airports_ref |>
+  rowwise() |>
+  mutate(timezone = lutz::tz_lookup_coords(lat, lon, method = "fast")) |>
+  ungroup() |>
+  filter(!is.na(timezone))
+
+dep_tz_tbl <- tz_lookup |>
+  dplyr::select(ICAO, departure_tz = timezone)
+
+arr_tz_tbl <- tz_lookup |>
+  dplyr::select(ICAO, arrival_tz = timezone)
+
+flights <- flights |>
+  left_join(dep_tz_tbl, by = c("departure" = "ICAO")) |>
+  left_join(arr_tz_tbl, by = c("arrival" = "ICAO")) |>
+  mutate(
+    dep_local  = lubridate::with_tz(firstseen_utc, departure_tz),
+    arr_local  = lubridate::with_tz(lastseen_utc,  arrival_tz),
+    dep_minute_local = lubridate::hour(dep_local) * 60L + lubridate::minute(dep_local),
+    arr_minute_local = lubridate::hour(arr_local) * 60L + lubridate::minute(arr_local)
+  )
+
+WINDOW_START <- 5 * 60
+WINDOW_END <- 22 * 60
+
+flights <- flights |>
+  filter(dep_minute_local >= WINDOW_START, dep_minute_local <= WINDOW_END)
+
+flights |>
+  count(airline, service_date_utc, name = "n_flights") |>
+  group_by(airline) |>
+  summarise(
+    days = n(),
+    avg_flights = mean(n_flights),
+    max_flights = max(n_flights),
+    .groups = "drop"
+  )
+```
+
+```{r}
+
+clean_flights <- all_data |>
+  mutate(
+    airline = stringr::str_sub(callsign, 1, 3),
+    firstseen_utc = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen_utc  = lubridate::ymd_hms(lastseen, tz = "UTC"),
+    duration_min = as.numeric(difftime(lastseen_utc, firstseen_utc, units = "mins"))
+  ) |>
+  filter(
+    departure %in% us_airports$ICAO,
+    arrival %in% us_airports$ICAO,
+    departure != arrival,
+    airline %in% ptp_prefix,
+    duration_min > 20, duration_min < 600
+  )
+
+fleet_sizes <- clean_flights |>
+  group_by(airline) |>
+  summarise(n_planes = n_distinct(icao24)) |>
+  tibble::deframe()
+
+route_block_times <- clean_flights |>
+  group_by(airline, departure, arrival) |>
+  summarise(
+    block_min = as.integer(median(duration_min)),
+    .groups = "drop"
+  )
+
+transition_matrix <- clean_flights |>
+  count(airline, departure, arrival, name = "flights") |>
+  group_by(airline, departure) |>
+  mutate(prob = flights / sum(flights)) |>
+  ungroup() |>
+  dplyr::select(airline, origin = departure, dest = arrival, prob)
+
+starting_weights <- clean_flights |>
+  count(airline, departure, name = "weight") |>
+  group_by(airline) |>
+  mutate(prob = weight / sum(weight)) |>
+  ungroup()
+
+simulate_airline <- function(airline_code, n_planes, days = 7) {
+  
+  my_trans <- transition_matrix |> filter(airline == airline_code)
+  my_blocks <- route_block_times |> filter(airline == airline_code)
+  my_starts <- starting_weights |> filter(airline == airline_code)
+  
+  if(nrow(my_starts) == 0) return(NULL) # Skip if no data
+  
+  start_sim <- as.POSIXct("2026-01-01 05:00:00", tz = "UTC")
+  end_sim   <- start_sim + days(days)
+  
+  fleet <- tibble(
+    tail_number = sprintf("N%04d%s", 1:n_planes, airline_code),
+    airline = airline_code,
+    current_airport = sample(my_starts$departure, n_planes, replace = TRUE, prob = my_starts$prob),
+    # Stagger starts between 05:00 and 09:00 UTC to avoid a massive "simultaneous takeoff" spike
+    next_available = start_sim + minutes(sample(0:240, n_planes, replace = TRUE)) 
+  )
+  
+  schedule_log <- list()
+  
+  cat(sprintf("Simulating %s with %d planes...\n", airline_code, n_planes))
+  pb <- txtProgressBar(min = 0, max = n_planes, style = 3)
+  
+  for (p in 1:n_planes) {
+    
+    curr_tail <- fleet$tail_number[p]
+    curr_loc  <- fleet$current_airport[p]
+    curr_time <- fleet$next_available[p]
+    
+    plane_legs <- list()
+    
+    while (curr_time < end_sim) {
+      
+      routes <- my_trans |> filter(origin == curr_loc)
+      
+      if (nrow(routes) == 0) {
+        curr_loc <- sample(my_starts$departure, 1, prob = my_starts$prob)
+        curr_time <- curr_time + hours(4) 
+        next
+      }
+      
+      next_dest <- sample(routes$dest, 1, prob = routes$prob)
+      
+      blk <- my_blocks |> 
+        filter(departure == curr_loc, arrival == next_dest) |> 
+        pull(block_min)
+      
+      if(length(blk) == 0) blk <- 120
+      
+      dep_time <- curr_time
+      arr_time <- dep_time + minutes(blk)
+      
+      utc_hour <- lubridate::hour(dep_time)
+      if (utc_hour >= 6 && utc_hour < 10) { 
+        dep_time <- dep_time + hours(6)
+        arr_time <- dep_time + minutes(blk)
+      }
+      
+      plane_legs[[length(plane_legs) + 1]] <- tibble(
+        airline = airline_code,
+        tail_number = curr_tail,
+        departure = curr_loc,
+        arrival = next_dest,
+        dep_time = dep_time,
+        arr_time = arr_time,
+        duration = blk
+      )
+      
+      curr_loc <- next_dest
+      curr_time <- arr_time + minutes(45)
+    }
+    
+    schedule_log[[p]] <- bind_rows(plane_legs)
+    setTxtProgressBar(pb, p)
+  }
+  close(pb)
+  
+  bind_rows(schedule_log)
+}
+
+sim_results <- list()
+
+for (al in names(fleet_sizes)) {
+  sim_results[[al]] <- simulate_airline(al, fleet_sizes[[al]])
+}
+
+full_gen_schedule <- bind_rows(sim_results)
+
+airport_locs_clean <- airport_lookup_1 |> 
+  transmute(ICAO = ICAO, lat = latitude, lon = longitude) |> 
+  filter(!is.na(lat), !is.na(lon)) |> 
+  distinct(ICAO, .keep_all = TRUE)
+
+point_to_point_schedule <- full_gen_schedule |>
+  mutate(
+    dep_time_et = with_tz(dep_time, "America/New_York"),
+    arr_time_et = with_tz(arr_time, "America/New_York")
+  ) |>
+  filter(dep_time_et < as.POSIXct("2026-01-08", tz = "America/New_York")) |>
+  mutate(
+    day_of_week = factor(weekdays(dep_time_et), 
+                         levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"), 
+                         ordered = TRUE),
+    callsign = paste0(airline, str_sub(tail_number, 2, 5)),
+    
+    departure_time = as_hms(dep_time_et),
+    arrival_time = as_hms(arr_time_et),
+    
+    duration = as.numeric(duration * 60)
+  ) |>
+  left_join(airport_locs_clean |> rename(dep_latitude = lat, dep_longitude = lon), by = c("departure" = "ICAO")) |>
+  left_join(airport_locs_clean |> rename(arr_latitude = lat, arr_longitude = lon), by = c("arrival" = "ICAO")) |>
+  dplyr::select(
+    airline, callsign, tail_number,
+    departure, arrival,
+    day_of_week, departure_time, arrival_time, duration,
+    dep_latitude, dep_longitude, arr_latitude, arr_longitude
+  ) |>
+  arrange(day_of_week, departure_time)
+
+saveRDS(point_to_point_schedule, "point_to_point_schedule.rds")
+```
+
+```{r}
+
+schedule <- bind_rows(final_formatted, point_to_point_schedule)
+```
+
+```{r}
+
+build_flight_frames <- function(schedule, week_start, step_mins = 30) {
+  step_by <- paste(step_mins, "mins")
+   
+  sched <- schedule |>
+    mutate(
+      day_index = as.integer(day_of_week) - 1L,
+      dep_dt = as.POSIXct(week_start, tz = "UTC") + days(day_index) + seconds(as.numeric(departure_time)),
+      arr_dt = as.POSIXct(week_start, tz = "UTC") + days(day_index) + 
+               days(if_else(as.numeric(arrival_time) < as.numeric(departure_time), 1L, 0L)) + 
+               seconds(as.numeric(arrival_time)),
+      airline = str_extract(callsign, "^[A-Z]+")
+    ) |>
+    group_by(day_index, callsign, departure, arrival) |>
+    mutate(
+      flight_id = cur_group_id(), 
+      ) |>
+    ungroup() |>
+    filter(
+      is.finite(dep_latitude), is.finite(dep_longitude),
+      is.finite(arr_latitude), is.finite(arr_longitude),
+      arr_dt > dep_dt
+    )
+ 
+  # 2. Calculate Great Circle positions based on Time Fractions
+  frames <- sched |>
+    transmute(flight_id, callsign, airline, dep_dt, arr_dt, 
+              dep_lon = dep_longitude, dep_lat = dep_latitude, 
+              arr_lon = arr_longitude, arr_lat = arr_latitude) |>
+    mutate(
+      path_data = pmap(list(dep_lon, dep_lat, arr_lon, arr_lat, dep_dt, arr_dt), 
+                       function(d_lon, d_lat, a_lon, a_lat, d_t, a_t) {
+                         
+        # Generate the time sequence
+        t_seq <- seq(
+          from = lubridate::floor_date(d_t, unit = step_by), 
+          to   = lubridate::ceiling_date(a_t, unit = step_by), 
+          by   = step_by
+        )
+        
+        # Filter to actual flight duration and ensure at least start/end exist
+        t_seq <- t_seq[t_seq >= d_t & t_seq <= a_t]
+        if (length(t_seq) < 2) {
+           t_seq <- c(d_t, a_t)
+        }
+        
+        # --- ROBUST CALCULATION METHOD ---
+        
+        # 1. Calculate total Great Circle distance and initial bearing
+        #    (distHaversine returns meters, bearing returns degrees)
+        p1 <- c(d_lon, d_lat)
+        p2 <- c(a_lon, a_lat)
+        total_dist <- distHaversine(p1, p2)
+        init_bear  <- bearing(p1, p2)
+        
+        # 2. Calculate fraction of flight complete at each time step
+        total_duration <- as.numeric(difftime(a_t, d_t, units = "secs"))
+        
+        # Handle zero-duration edge case
+        if (total_duration <= 0) {
+          return(tibble(time = t_seq, lon = d_lon, lat = d_lat))
+        }
+        
+        time_elapsed <- as.numeric(difftime(t_seq, d_t, units = "secs"))
+        fracs <- time_elapsed / total_duration
+        
+        # 3. Project position using destPoint (Start + Bearing + Distance)
+        #    This works on vectors, so we pass the vector of distances
+        distances <- total_dist * fracs
+        coords <- destPoint(p1, init_bear, distances)
+        
+        tibble(
+          time = t_seq,
+          lon = coords[,1],
+          lat = coords[,2]
+        )
+      })
+    ) |>
+    unnest(path_data) |>
+    dplyr::select(flight_id, callsign, airline, dep_dt, arr_dt, time, lat, lon)
+ 
+  return(frames)
+}
+
+# --- build a trailing "wake" that disappears after landing ---
+build_trail_layers <- function(frames,
+                               step_mins = 30,
+                               trail_mins = 120) {
+  step_seconds <- step_mins * 60
+  k <- ceiling(trail_mins / step_mins)
+
+  offsets <- tibble(off_s = (0:k) * step_seconds)
+
+  # propagate each observed point forward into future frames within the trail window
+  trail_pts <- frames |>
+    inner_join(offsets, by = character()) |>
+    mutate(frame_time = time + seconds(off_s)) |>
+    filter(frame_time >= dep_dt, frame_time <= arr_dt) |>
+    dplyr::select(flight_id, callsign, airline, dep_dt, arr_dt, frame_time, time, lat, lon) |>
+    arrange(flight_id, frame_time, time)
+
+  # turn trail points into segments for smoother "line" trails
+  trail_segs <- trail_pts |>
+    group_by(flight_id, frame_time) |>
+    arrange(time, .by_group = TRUE) |>
+    mutate(
+      lat2 = lead(lat),
+      lon2 = lead(lon),
+      time2 = lead(time)
+    ) |>
+    filter(!is.na(lat2), !is.na(lon2)) |>
+    # optional fade: newer segments are more opaque
+    mutate(
+      age_s = as.numeric(difftime(frame_time, time2, units = "secs")),
+      alpha = 0.25 * (1 - pmin(1, age_s / (trail_mins * 60)))
+    ) |>
+    ungroup()
+
+  # current plane position at each frame_time (latest time within that frame)
+  current_pts <- trail_pts |>
+    group_by(flight_id, frame_time) |>
+    slice_max(time, n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  list(trail_segs = trail_segs, current_pts = current_pts)
+}
+
+frames <- build_flight_frames(
+  schedule,
+  week_start = as.Date("2025-10-13"),
+  step_mins = 30
+)
+
+step_mins <- 30
+
+grid <- seq(
+  from = as.POSIXct("2025-10-13 00:00:00", tz = "UTC"),
+  to   = as.POSIXct("2025-10-20 00:00:00", tz = "UTC"),
+  by   = paste(step_mins, "mins")
+)
+
+frame_lookup <- tibble(
+  frame_time = grid,
+  frame_id   = seq_along(grid)
+)
+
+layers <- build_trail_layers(frames, step_mins = step_mins, trail_mins = 120)
+
+layers$trail_segs <- layers$trail_segs |>
+  left_join(frame_lookup, by = "frame_time")
+
+layers$current_pts <- layers$current_pts |>
+  left_join(frame_lookup, by = "frame_time")
+
+layers$trail_segs <- layers$trail_segs |>
+  filter(
+    !is.na(frame_id),
+    is.finite(lon), is.finite(lat),
+    is.finite(lon2), is.finite(lat2)
+  )
+
+layers$current_pts <- layers$current_pts |>
+  filter(!is.na(frame_id))
+```
+
+```{r}
+
+us_map <- map_data("state")
+
+p <- ggplot() +
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    linewidth = 0.1,
+    color = "grey40",
+    fill  = "grey10"
+  ) +
+  geom_segment(
+    data = layers$trail_segs,
+    aes(
+      x = lon, y = lat,
+      xend = lon2, yend = lat2,
+      group = interaction(flight_id, frame_time),
+      alpha = alpha
+    ),
+    color = "white",
+    linewidth = 0.35,
+    lineend = "round"
+  ) +
+  scale_alpha_identity() +
+  geom_point(
+    data = layers$current_pts,
+    aes(x = lon, y = lat, group = flight_id),
+    color = "white",
+    alpha = 0.9,
+    size = 0.8
+  ) +
+  coord_quickmap(xlim = c(-125, -66), ylim = c(24, 50)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.background  = element_rect(fill = "white", color = NA),
+    plot.background   = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    text       = element_text(color = "black"),
+    axis.text  = element_text(color = "black"),
+    axis.title = element_text(color = "black")
+  ) +
+  labs(
+    title = "{format(
+      as.POSIXct('2025-12-22 04:00:00', tz = 'America/New_York') +
+        lubridate::minutes(30) * (as.integer(current_frame) - 10),
+      '%a %H:%M'
+    )} ET"
+  ) +
+  transition_manual(frame_id) +
+  ease_aes("linear")
+
+animate(
+  p,
+  nframes = length(grid),
+  fps = 15,
+  width = 1000,
+  height = 600,
+  renderer = gifski_renderer()
+)
+```
+
+```{r}
+
+library(truncnorm) # For realistic delay distributions
+
+# -------------------------------------------------------------------------
+# 1. PARAMETER DEFINITIONS
+# -------------------------------------------------------------------------
+# These align with your "Start an airline" requirements
+
+sim_params <- list(
+  # Turnaround Times (minutes)
+  min_turn_hub = 45,      # Time needed at a hub
+  min_turn_spoke = 30,    # Time needed at a spoke/P2P
+  
+  # Block Time Padding (buffer built into the schedule)
+  block_buffer_pct = 0.10, # 10% padding added to ideal flight time
+  
+  # Disruption Probabilities (The "Random, non-location specific disruption")
+  prob_minor_delay = 0.20, # 20% chance of a minor issue (1-15 mins)
+  prob_major_delay = 0.05, # 5% chance of a major issue (15-120 mins)
+  
+  # Airport Capacity Limits (Simplified for "Start Small")
+  # Max departures per hour allowed before congestion delays kick in
+  capacity_tiers = list(
+    "large_airport" = 60,
+    "medium_airport" = 30
+  )
+)
+
+# -------------------------------------------------------------------------
+# 2. HELPER FUNCTIONS: DISRUPTION GENERATORS
+# -------------------------------------------------------------------------
+
+# Generate random operational delay (crew late, maintenance, baggage)
+generate_exogenous_delay <- function(n, params) {
+  # Base: Most flights leave on time (0 delay)
+  delays <- rep(0, n)
+  
+  # Minor delays: Truncated Normal distribution
+  is_minor <- runif(n) < params$prob_minor_delay
+  delays[is_minor] <- rtruncnorm(sum(is_minor), a=1, b=30, mean=10, sd=5)
+  
+  # Major delays: Gamma distribution (long tail)
+  is_major <- runif(n) < params$prob_major_delay
+  delays[is_major] <- rgamma(sum(is_major), shape=2, scale=15) + 15
+  
+  return(round(delays))
+}
+
+# Generate en-route variability (Headwinds/Tailwinds)
+generate_block_variability <- function(n, scheduled_duration) {
+  # Normal distribution centered on 0, sd related to flight length
+  noise <- rnorm(n, mean = 0, sd = sqrt(scheduled_duration) * 0.5)
+  return(round(noise))
+}
+```
+
+```{r}
+
+run_network_simulation <- function(input_schedule, params) {
+  
+  # 1. Prepare the Data
+  # We need to ensure the schedule is sorted by Aircraft and Time
+  sim_data <- input_schedule |>
+    arrange(tail_number, departure_time) |>
+    group_by(tail_number) |>
+    mutate(
+      leg_sequence = row_number(),
+      
+      # Calculate Scheduled durations (Plan)
+      sched_dep_min = as.numeric(departure_time) / 60,
+      sched_arr_min = as.numeric(arrival_time) / 60,
+      sched_block   = sched_arr_min - sched_dep_min,
+      
+      # Identify Turn Type (Hub vs Spoke) for minimum turn time logic
+      required_turn = if_else(arrival %in% c("KATL", "KORD", "KDEN", "KDFW", "KCLT"), 
+                              params$min_turn_hub, 
+                              params$min_turn_spoke)
+    ) |>
+    ungroup()
+  
+  # Initialize storage for the "Actual" results
+  n_flights <- nrow(sim_data)
+  
+  # Pre-calculate exogenous delays (Vectorized for speed)
+  sim_data$exo_delay_dep <- generate_exogenous_delay(n_flights, params)
+  sim_data$block_noise   <- generate_block_variability(n_flights, sim_data$sched_block)
+  
+  # 2. The Simulation Loop (Iterative by Tail Number)
+  # We use a loop because Leg N depends on the outcome of Leg N-1
+  
+  # Split by tail number for faster processing
+  flights_by_tail <- split(sim_data, sim_data$tail_number)
+  
+  results_list <- lapply(flights_by_tail, function(plane_schedule) {
+    
+    # Initialize columns
+    plane_schedule$act_dep_min <- NA
+    plane_schedule$act_arr_min <- NA
+    plane_schedule$prop_delay  <- 0 # Propagated delay
+    
+    for (i in 1:nrow(plane_schedule)) {
+      
+      # Step A: Determine Earliest Possible Departure
+      if (i == 1) {
+        # First flight of the day: Only affected by exogenous delay (e.g., crew late)
+        ready_time <- 0
+      } else {
+        # Subsequent flights: Ready when previous flight arrived + Turn Time
+        ready_time <- plane_schedule$act_arr_min[i-1] + plane_schedule$required_turn[i-1]
+      }
+      
+      # Step B: Calculate Actual Departure
+      # Plane leaves at Scheduled Time OR Ready Time (whichever is later) + Exogenous Delay
+      sched_time <- plane_schedule$sched_dep_min[i]
+      
+      # Calculate Propagated Delay (The "Knock-on" effect)
+      # If Ready Time > Scheduled Time, that difference is propagated delay
+      prop_delay <- max(0, ready_time - sched_time)
+      
+      plane_schedule$prop_delay[i] <- prop_delay
+      
+      # Final Departure Time
+      plane_schedule$act_dep_min[i] <- sched_time + prop_delay + plane_schedule$exo_delay_dep[i]
+      
+      # Step C: Calculate Actual Arrival
+      # Actual Dep + Scheduled Block + Padding Buffer + Enroute Noise
+      # Note: If they fly faster (negative noise), they can recover some delay
+      actual_block <- plane_schedule$sched_block[i] + plane_schedule$block_noise[i]
+      
+      plane_schedule$act_arr_min[i] <- plane_schedule$act_dep_min[i] + actual_block
+    }
+    
+    return(plane_schedule)
+  })
+  
+  # Recombine
+  final_results <- bind_rows(results_list)
+  
+  return(final_results)
+}
+```
+
+```{r}
+
+# Filter for Hub Carriers from your generated schedule
+hub_schedule <- schedule |>
+  filter(airline %in% c("UAL", "DAL", "AAL")) 
+
+# Run Simulation
+hub_results <- run_network_simulation(hub_schedule, sim_params)
+
+# Calculate Metrics
+hub_metrics <- hub_results |>
+  summarise(
+    Scenario = "Hub-and-Spoke",
+    Total_Flights = n(),
+    Avg_Arr_Delay = mean(act_arr_min - sched_arr_min),
+    Propagated_Delay_Share = sum(prop_delay) / sum(act_arr_min - sched_arr_min)
+  )
+
+print(hub_metrics)
+```
+
+```{r}
+
+# Filter for P2P Carriers
+p2p_schedule <- schedule |>
+  filter(airline %in% c("SWA", "NKS", "JBU", "FFT"))
+
+# Run Simulation
+p2p_results <- run_network_simulation(p2p_schedule, sim_params)
+
+# Calculate Metrics
+p2p_metrics <- p2p_results |>
+  summarise(
+    Scenario = "Point-to-Point",
+    Total_Flights = n(),
+    Avg_Arr_Delay = mean(act_arr_min - sched_arr_min),
+    Propagated_Delay_Share = sum(prop_delay) / sum(act_arr_min - sched_arr_min)
+  )
+
+print(p2p_metrics)
+```
+
+```{r}
+
+visualize_propagation <- function(sim_output, target_tail) {
+  
+  data <- sim_output |>
+    filter(tail_number == target_tail) |>
+    arrange(departure_time) |>
+    mutate(
+      leg_id = paste(departure, ">", arrival),
+      delay_status = case_when(
+        prop_delay > 15 ~ "Propagated Delay",
+        exo_delay_dep > 15 ~ "New Disruption",
+        TRUE ~ "On Time / Recovered"
+      )
+    )
+  
+  ggplot(data) +
+    # Plan
+    geom_segment(aes(x = sched_dep_min/60, xend = sched_arr_min/60, 
+                     y = leg_sequence, yend = leg_sequence), 
+                 color = "grey", size = 2, alpha = 0.5) +
+    # Actual
+    geom_segment(aes(x = act_dep_min/60, xend = act_arr_min/60, 
+                     y = leg_sequence, yend = leg_sequence, color = delay_status), 
+                 size = 1.5) +
+    scale_y_reverse(breaks = data$leg_sequence, labels = data$leg_id) +
+    labs(
+      title = paste("Delay Propagation for Aircraft:", target_tail),
+      x = "Hour of Day (Local)",
+      y = "Flight Leg",
+      color = "Delay Source"
+    ) +
+    theme_minimal()
+}
+
+# Example usage (pick a tail number from your results)
+visualize_propagation(hub_results, "N00001DAL")
+```
