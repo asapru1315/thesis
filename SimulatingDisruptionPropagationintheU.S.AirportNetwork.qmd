@@ -1,0 +1,2381 @@
+---
+title: "Simulating Disruption Propagation in the U.S. Airport Network"
+author:
+  - name: Anmol Sapru '26
+  - name: "\\small Department of Statistical Science, Duke University"
+  
+date: 2026-04-17
+date-format: "long"
+format:
+  pdf:
+    pdf-engine: xelatex
+    margin: 1in
+execute:
+  echo: false
+  warning: false
+  message: false
+bibliography: references.bib
+---
+
+**Advisor:** Yue Jiang, \small Associate Professor of the Practice of Statistical Science at Duke University
+
+```{r load-packages, message = FALSE}
+
+library(airportr)
+library(maps)
+library(geosphere)
+library(httr)
+library(jsonlite)
+library(fuzzyjoin)
+library(rvest)
+library(lutz)
+library(hms)
+library(mgcv)
+library(slider)
+library(mapproj)
+library(knitr)
+library(truncnorm)
+library(foreach)
+library(doParallel)
+library(patchwork)
+library(philentropy)
+library(MASS)
+library(tidyverse)
+library(scales)
+library(igraph)
+library(reshape2)
+```
+
+```{r setting-graphs, include = FALSE}
+
+knitr::opts_chunk$set(fig.pos = "H")
+```
+
+## Abstract
+
+The United States’ air transportation system is among the world's most complex networks. According to the Bureau of Transportation Statistics, approximately 25,000 flights carry about 2 million passengers each day through a deeply interconnected web of airline, airport, and airplane operations. However, this interconnectedness can also be a drawback: when one node is disrupted, the impacts rarely stay contained. Using public data from ADS-B transponders of [The OpenSky Network](https://opensky-network.org), this thesis builds a simulation of air travel in the contiguous United States. In modeling these disruptions at scale, considerations of airline schedules and airport runway queues for varying delay scenarios were incorporated. Results show that the ever-growing hubs at the center of hub-and-spoke airlines create choke points. Disruptions, measured by propagated delay per unit of initial delay and network centrality measures, ripple across the system disproportionately to events at spokes or other origin and destination stations. The simulation provides a detailed baseline to build on in other regions, adapt to various disruption scenarios, and support airline scheduling decisions.
+
+\pagebreak
+
+## Introduction
+
+The propagation of flight delays continues to become an increasingly influential area of study as our air transportation networks grow in scale and complexity [@bts_transtats]. These disruptions are often triggered by local events, such as weather or operational restrictions, but their impacts are shaped by the network's structure. Therefore, understanding the characteristics of airports and scheduling practices can provide insight into system resilience, which could be critical for improving reliability. This motivated a closer examination of these air transportation disruptions through the lenses of operations research and network modeling.
+
+In operations research, this tension is well documented. Systems optimized for efficiency, such as airlines with short turn times, high aircraft utilization rates, and numerous infrastructure constraints, tend to sacrifice robustness when disruptions occur [@lordan2016] [@zhalechian2018]. These route network variables affect resilience levels and vary across operator types [@alamsyah2019icoict].
+
+Air travel disruptions have been studied through multiple statistical lenses. Network theory has been used to characterize the properties of air transportation systems for decades [@lordan2021]. Agent-based modeling has provided frameworks for representing decision-making during disruptions, in which airlines, airports, air traffic control, and passengers each pursue their own objectives [@grether2013]. Many concepts from operational research have also been applied to optimize elements of air network systems.
+
+Thus, while existing research has examined delay propagation using historical data, no work has combined realistic operational constraints together with network simulation across multiple carrier types.
+
+This thesis constructs a simulation that models such disruptions at scale, assembling the network based on airline schedules, airport size, and runway queues across varying delay and weather scenarios. The results focus on the role of airports in propogating or mitigating disruptions. Each airport acts as a node that can significantly affect how operations are modified; an idea that has been studied more closely since the Southwest Airlines Holiday Meltdown in 2022 [@peng2025].
+
+Finding the proper data required scouting multiple potential sources, since we are dealing with a deeply interconnected network. The most comprehensive data sets of airline schedules come from Global Distribution Systems, such as OAG, which agencies often use to search and book travel [@oag_schedules]. Despite this data requiring minimal cleaning and being easy to plug into the research, it was cost-prohibitive for this project. The Department of Transportation also possesses aviation data, but no data sets provide information that can be transformed into departure and arrival schedules [@bts_transtats].
+
+Therefore, the work incorporated data from The OpenSky Network, an open-access platform for real-time and historical air traffic surveillance data from a global network of ADS-B receivers [@schafer2014]. The data pulled has state vectors and flight trajectories from airplane transponders, which can be accessed through methods such as a live API. This project used The OpenSky Network's [Trino interface](https://opensky-network.org/data/trino) through the [pyopensky](https://mode-s.org/pyopensky/) package [@olive_sun_pyopensky].
+
+For this study, historical flight data were retrieved for the period between October 6, 2025, and October 26, 2025, inclusive (21 days). This period was relatively calm for aviation in the contiguous United States, with few weather events (e.g., hurricanes and snowstorms), and it avoided the Federal Aviation Administration's Air Traffic Control limitation in November of 2025. By selecting this comparatively stable timeframe, the data set provides a cleaner baseline of routine air traffic operations to add disruptions to.
+
+Using The OpenSky Network was a sacrifice in the pursuit of scheduling perfection in exchange for greater reproducibility and lower cost. Additionally, removing the proprietary data sets would make the theories easier to expand to other time periods or regions.
+
+The United States is home to many different types of airlines. To best understand disruptions, the schedules of both hub-and-spoke and point-to-point carriers were needed. The analysis included airlines with fleets of at least 100 aircraft. The hub-and-spoke carriers: Alaska Airlines, American Airlines, Delta Air Lines, United Airlines, as well as point-to-point carriers: Frontier Airlines, JetBlue Airways, Southwest Airlines, and Spirit Airlines. The mainline airlines have regional carriers that fly under their brand (e.g., Horizon Air for Alaska Airlines), which were also pulled from OpenSky.
+
+```{r load-data, warning = FALSE}
+
+path <- "opensky_daily_exports"
+csv_files <- list.files(path, pattern = "\\.csv$", full.names = TRUE)
+data_list <- lapply(csv_files, read.csv)
+all_data <- do.call(rbind, data_list) |>
+  filter(stringr::str_starts(departure, "K") & stringr::str_starts(arrival, "K"))
+```
+
+The data set comprises 455,672 rows across the study period. Each row represents a single observed flight segment, with the following fields:
+
+-   `icao24` is the unique hexadecimal transponder address assigned to each aircraft, which serves as the primary identifier for tracking airplanes across flights and days
+
+-   `callsign` contains the airline flight number as broadcast by the aircraft's transponder, which links the observed flight to a specific, repeated scheduled service
+
+-   `firstseen` and `lastseen` record the UTC timestamps when OpenSky's ADS-B receiver network first and last detected the aircraft's transponder signal for a given flight segment
+
+-   `departure` and `arrival` contain the ICAO airport codes inferred by OpenSky based on the aircraft's position from ADS-B receivers at the start and end of each segment
+
+A key problem with this data was a spike around midnight: flights that left before 11 PM EST but did not land before 11:59 PM EST were erroneous, given a departure time of midnight the next day in OpenSky's database, which shortened flight times and required some changes in scheduling logic for point-to-point flights.
+
+### General Data Cleaning
+
+```{r commercial-airports}
+
+us_airports <- 
+  readr::read_csv("https://davidmegginson.github.io/ourairports-data/airports.csv") |>
+  filter(
+    iso_country == "US",
+    scheduled_service == "yes",
+    type %in% c("large_airport", "medium_airport"),
+    !is.na(ident)
+  ) |>
+  transmute(
+    airport_name = name,
+    ICAO = stringr::str_to_upper(stringr::str_trim(ident)),
+    IATA = stringr::str_to_upper(stringr::str_trim(iata_code)),
+    latitude_deg, 
+    longitude_deg
+  ) |>
+  filter(stringr::str_starts(ICAO, "K"))
+```
+
+After pulling from OpenSky, more data cleaning was performed. Most of the actions were performed with the "tidy data" framework [@tidyverse].
+
+First was making sure the airports were correct. The only airports used were those with ICAO codes (i.e., four-letter location identifiers set by the International Civil Aviation Organization) that began with 'K', which represents the commercial airports in the contiguous United States. Since OpenSky uses the transponder location instead of the schedule data, some assumed departure and arrival airports were erroneous (e.g., a helipad near a major airport). The commercial airports that were kept in the data set were determined by [David Megginson's OurAirports'](https://ourairports.com/airports.html) `airports.csv` [@ourairports_data]. From this data set, only "medium" and "large" airports with scheduled service were retained, as small airports were reviewed and determined to be irrelevant to the scheduled operations of the airlines studied.
+
+```{r fig-1, fig.cap="Large and Medium Airports with Scheduled Service from David Megginson's OurAirports"}
+
+us_states <- map_data("state")
+
+us_airports |>
+  filter(
+    latitude_deg >= 24.396308 & latitude_deg <= 49.384358,
+    longitude_deg >= -124.848974 & longitude_deg <= -66.93457
+  ) |>
+  ggplot() +
+  geom_polygon(data = us_states, aes(x = long, y = lat, group = group), 
+               fill = "gray90", color = "white") +
+  geom_point(aes(x = longitude_deg, y = latitude_deg)) +
+  coord_map() + 
+  theme_void() +
+  labs(title = "Scheduled Service Airports (US Lower 48)")
+
+us_airports <- us_airports |>
+  filter(
+    latitude_deg >= 24.396308 & latitude_deg <= 49.384358,
+    longitude_deg >= -124.848974 & longitude_deg <= -66.93457
+  ) |>
+  dplyr::select(-latitude_deg, -longitude_deg)
+```
+
+```{r replacing-non-commercials, message = FALSE}
+
+airport_lookup_1 <- read_csv("https://davidmegginson.github.io/ourairports-data/airports.csv") |>
+  dplyr::select("ICAO" = "ident", "latitude" = "latitude_deg", "longitude" = "longitude_deg")
+
+download.file("https://nfdc.faa.gov/webContent/28DaySub/extra/19_Feb_2026_APT_CSV.zip", 
+              destfile = "APT_CSV.zip", mode = "wb")
+
+contents <- unzip("APT_CSV.zip", list = TRUE)
+unzip("APT_CSV.zip", 
+      files = contents[grepl("APT_BASE\\.csv$", contents$Name, ignore.case = TRUE), , drop = FALSE]$Name, 
+      exdir = "apt_extract")
+
+airport_lookup_2 <- read_csv(
+  list.files("apt_extract", pattern = "APT_BASE\\.csv$", recursive = TRUE, 
+             full.names = TRUE, ignore.case = TRUE)[1]
+) |>
+  dplyr::select("ICAO" = "ARPT_ID", "latitude" = "LAT_DECIMAL", "longitude" = "LONG_DECIMAL")
+
+airport_lookups <- bind_rows(airport_lookup_1, airport_lookup_2) |>
+  distinct(ICAO, .keep_all = TRUE)
+
+commercial_coords <- airportr::airports |>
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |>
+  mutate(ICAO = str_to_upper(str_trim(ICAO))) |>
+  distinct() |>
+  semi_join(tibble(ICAO = str_to_upper(str_trim(us_airports$ICAO))), by = "ICAO") |>
+  filter(!is.na(lat), !is.na(lon))
+
+lookup_coords <- airport_lookups |>
+  transmute(from_icao = str_to_upper(str_trim(ICAO)), 
+            lat = as.numeric(latitude), lon = as.numeric(longitude)) |>
+  distinct(from_icao, .keep_all = TRUE) |>
+  filter(!is.na(from_icao), !is.na(lat), !is.na(lon))
+
+nearest_commercial <- function(lat, lon, comm_tbl, limit_meters = 40000) {
+  d_m <- geosphere::distHaversine(cbind(comm_tbl$lon, comm_tbl$lat), c(lon, lat))
+  min_dist <- min(d_m)
+  i <- which.min(d_m)
+  
+  if (min_dist <= limit_meters) {
+    tibble(nearest_icao = comm_tbl$ICAO[i], dist_m = min_dist)
+  } else {
+    tibble(nearest_icao = NA_character_, dist_m = min_dist)
+  }
+}
+
+closest_map_messy <- lookup_coords |>
+  mutate(nn = purrr::pmap(list(lat, lon), \(lat, lon)
+    nearest_commercial(lat, lon, commercial_coords, limit_meters = 40000)
+  )) |>
+  unnest(nn) |>
+  filter(!from_icao %in% commercial_coords$ICAO, !is.na(nearest_icao))
+```
+
+The replacement of the aforementioned erroneous departure and arrival airports was done with a simple closest airport calculation. In addition to using the OurAirports, the [Federal Aviation Administration's Airport Master Record](https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/) has latitude and longitude information about airfields across the United States [@faa_nfdc_apts_feb2026]. This was pulled for the FAA's Subscription effective February 19, 2026. Combined, the two have information about 91,309 unique ICAO codes.
+
+All ICAOs in this combined airfields lookup were matched to the closest large or medium airport with scheduled service in OurAirports' `airport.csv`. The maximum distance limit of the "catchment area" was set to 40 kilometers—with anything further being removed due to uncertainty (e.g., many flights in Northern Maine were likely international flights that were mistakenly categorized as flying domestically). The longitude and latitude for the commercial airports were obtained through the [airportr](https://dshkol.github.io/airportr/index.html) package [@dshkol_airportr].
+
+```{r fig-2, fig.cap="Mappings to New England Commercial Airports with Scheduled Service"}
+
+target_hubs <- c("KBDL", "KHVN", "KORH", "KHYA", "KEWB", "KBOS", "KBED", 
+                 "KACK", "KPVD", "KWST", "KLEB", "KMHT", "KPSM", "KBTV", 
+                 "KRUT", "KAUG", "KBGR", "KBHB", "KPQI", "KPWM", "KRKD")
+
+plot_data <- closest_map_messy |>
+  filter(nearest_icao %in% target_hubs) |>
+  rename(from_lat = lat, from_lon = lon) |>
+  left_join(commercial_coords, by = c("nearest_icao" = "ICAO")) |>
+  rename(to_lat = lat, to_lon = lon)
+
+ne_state_names <- c("massachusetts", "connecticut", "rhode island", 
+                    "new hampshire", "vermont", "maine")
+ne_map_bg <- map_data("state", region = ne_state_names)
+
+ggplot() +
+  geom_polygon(data = ne_map_bg, aes(x = long, y = lat, group = group), 
+               fill = "gray95", color = "gray60") +
+  geom_segment(data = plot_data, 
+               aes(x = from_lon, y = from_lat, xend = to_lon, yend = to_lat),
+               color = "steelblue", alpha = 0.4, linewidth = 0.3) +
+  geom_point(data = plot_data, aes(x = from_lon, y = from_lat), 
+             color = "steelblue", size = 0.5, alpha = 0.6) +
+  geom_point(data = plot_data |> distinct(nearest_icao, to_lon, to_lat), 
+             aes(x = to_lon, y = to_lat), color = "black", size = 2) +
+  coord_map() +
+  theme_void() +
+  labs(title = "Airport Catchment Areas Example",
+       subtitle = "Blue Dot ICAOs Mapped to Black Dot Commercial Airports")
+```
+
+```{r remove-twin-aisles}
+
+planes <- 
+  read_csv("https://s3.opensky-network.org/data-samples/metadata/aircraft-database-complete-2025-02.csv") |>
+  filter(`'icao24'` %in% all_data$icao24)
+
+twin_aisle_check <- all_data |>
+  filter(!icao24 %in% planes$`'icao24'`)
+
+twin_aisles <- planes |>
+  filter(str_detect(`'model'`, str_c(c("767", "777", "787", "A330", "A350", "310R", "A310"), collapse = "|")))
+
+MAX_RANGE_NM <- 3500
+
+twin_aisle_flights <- twin_aisle_check |>
+  left_join(
+    airportr::airports |>
+      dplyr::select(ICAO, Latitude, Longitude) |>
+      rename(lat = Latitude, lon = Longitude) |>
+      rename(dep_latitude = lat, dep_longitude = lon), 
+    by = c("departure" = "ICAO")
+  ) |>
+  left_join(
+    airportr::airports |>
+      dplyr::select(ICAO, Latitude, Longitude) |>
+      rename(lat = Latitude, lon = Longitude) |>
+      rename(arr_latitude = lat, arr_longitude = lon), 
+    by = c("arrival" = "ICAO")
+  ) |>
+  mutate(
+    distance_m = geosphere::distHaversine(
+      cbind(dep_longitude, dep_latitude), 
+      cbind(arr_longitude, arr_latitude)), 
+    distance_nm = distance_m / 1852
+  ) |>
+  group_by(icao24) |>
+  summarize(over_range = any(distance_m > MAX_RANGE_NM * 1852, na.rm = TRUE), .groups = "drop") |>
+  filter(over_range) |>
+  pull(icao24)
+```
+
+Twin-aisle aircraft were removed from the data set because the scope of this analysis was limited to operations within the contiguous United States, while these aircraft are predominantly used for long-haul, often international operations. When focusing on these domestic operations, these aircrafts' repeated exits from the United States would throw off scheduling logic later on. Additionally, removing these flights would not influence results as they reduce demand and capacity in the simulation proportionately.
+
+Aircraft type identification was conducted using OpenSky’s Complete Aircraft Database, which enables cross-referencing ICAO hexadecimal transponder codes (referred to as `icao24` above) to metainformation [@schafer2014]. Most twin-aisle aircraft were identified with this, but since the database is crowdsourced, some transponder codes could not be found.
+
+As a fallback for the other planes not in this data set, the rest of the aircraft's longest-distance operations during the time period was checked Any mission completed over 3500 nautical miles was removed. For reference, the longest single-aisle jet flight operated by an American carrier in the time period, Newark to Stockholm by United Airlines, is just under this threshold. [@simpleflying_757].
+
+```{r fig-3, fig.cap="Twin-Aisle Flights Removed From Data Set", fig.height=6}
+
+all_twin_ids <- unique(c(twin_aisles$`'icao24'`, twin_aisle_flights))
+
+map_data_twin <- all_data |>
+  filter(icao24 %in% all_twin_ids) |>
+  left_join(
+    airportr::airports |> dplyr::select(ICAO, dep_lat = Latitude, dep_lon = Longitude),
+    by = c("departure" = "ICAO")
+  ) |>
+  left_join(
+    airportr::airports |> dplyr::select(ICAO, arr_lat = Latitude, arr_lon = Longitude),
+    by = c("arrival" = "ICAO")
+  ) |>
+  filter(
+    !is.na(dep_lat), !is.na(dep_lon), !is.na(arr_lat), !is.na(arr_lon),
+    !(dep_lat == arr_lat & dep_lon == arr_lon) 
+  )
+
+map_data_domestic <- map_data_twin |>
+  filter(
+    dep_lon > -126, dep_lon < -66, dep_lat > 24, dep_lat < 50,
+    arr_lon > -126, arr_lon < -66, arr_lat > 24, arr_lat < 50
+  )
+
+domestic_twin_aisle <- ggplot() +
+  geom_polygon(data = us_states, aes(x = long, y = lat, group = group), 
+               fill = "gray95", color = "white", linewidth = 0.2) +
+  geom_curve(data = map_data_domestic, 
+             aes(x = dep_lon, y = dep_lat, xend = arr_lon, yend = arr_lat),
+             alpha = 0.3, linewidth = 0.4, curvature = 0.2) +
+  coord_fixed(1.3) +
+  theme_void() +
+  labs(
+    title = "United States Domestic Twin-Aisle Flights",
+    subtitle = paste("Total flights:", nrow(map_data_domestic))
+  )
+
+all_data <- all_data |>
+  arrange(icao24) |>
+  filter(!icao24 %in% twin_aisle_flights & !icao24 %in% twin_aisles$`'icao24'`)
+
+domestic_twin_aisle
+```
+
+```{r cleaning-airlines-airports}
+
+all_data <- all_data |>
+  left_join(closest_map_messy, by = c("departure" = "from_icao")) |>
+  mutate(departure = if_else(!is.na(nearest_icao), nearest_icao, departure)) |>
+  dplyr::select(-nearest_icao, -dist_m) |>
+  left_join(closest_map_messy, by = c("arrival" = "from_icao")) |>
+  mutate(arrival = if_else(!is.na(nearest_icao), nearest_icao, arrival)) |>
+  dplyr::select(-nearest_icao, -dist_m)
+
+flights <- all_data |>
+  filter(
+    departure %in% us_airports$ICAO, 
+    arrival %in% us_airports$ICAO, 
+    departure != arrival,
+    str_sub(callsign, 1, 3) %in% c("AAL", "ASA", "DAL", "EDV", "FFT", "JBU", "NKS", "RPA", 
+                                   "SKW", "SWA", "UAL", "QXE", "JIA", "ENY", "PDT")
+  ) |>
+  mutate(
+    firstseen = ymd_hms(firstseen),
+    lastseen = ymd_hms(lastseen),
+    duration = as.numeric(difftime(lastseen, firstseen, units = "secs")) + 30 * 60,
+    lastseen = firstseen + duration,
+    route_from = pmin(departure, arrival),
+    route_to = pmax(departure, arrival)
+  )
+```
+
+```{r add-timezones, warning = FALSE}
+
+airports_ref <- airportr::airports |>
+  dplyr::select(ICAO, lat = Latitude, lon = Longitude) |>
+  distinct()
+
+tz_lookup <- airports_ref |>
+  rowwise() |>
+  mutate(timezone = tz_lookup_coords(lat, lon, method = "fast")) |>
+  ungroup()
+
+flights <- flights |>
+  mutate(
+    firstseen = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen = lubridate::ymd_hms(lastseen, tz = "UTC")
+  )
+
+dep_tz_tbl <- tz_lookup |> dplyr::select(ICAO, departure_tz = timezone)
+arr_tz_tbl <- tz_lookup |> dplyr::select(ICAO, arrival_tz = timezone)
+
+flights <- flights |>
+  left_join(dep_tz_tbl, by = c("departure" = "ICAO")) |>
+  left_join(arr_tz_tbl, by = c("arrival" = "ICAO")) |>
+  mutate(
+    firstseen = as.POSIXct(firstseen, tz = "UTC"),
+    lastseen = as.POSIXct(lastseen, tz = "UTC"),
+    departure_tz = departure_tz |> as.character() |> stringr::str_trim(),
+    arrival_tz = arrival_tz |> as.character() |> stringr::str_trim(),
+    departure_tz = dplyr::if_else(is.na(departure_tz) | !departure_tz %in% OlsonNames(), "UTC", departure_tz),
+    arrival_tz = dplyr::if_else(is.na(arrival_tz) | !arrival_tz %in% OlsonNames(), "UTC", arrival_tz)
+  ) |>
+  group_by(departure_tz) |>
+  mutate(dep_local = lubridate::with_tz(firstseen, unique(departure_tz))) |>
+  ungroup() |>
+  group_by(arrival_tz) |>
+  mutate(arr_local = lubridate::with_tz(lastseen, unique(arrival_tz))) |>
+  ungroup() |>
+  mutate(
+    dep_minute = lubridate::hour(dep_local) * 60 + lubridate::minute(dep_local),
+    arr_minute = lubridate::hour(arr_local) * 60 + lubridate::minute(arr_local),
+    dep_hour = lubridate::hour(dep_local),
+    arr_hour = lubridate::hour(arr_local)
+  )
+```
+
+Other data cleaning involved work on the departure and arrival timezones. First, a reference table of the airports from the airportr package was built, which included the timezone determined by passing its latitude and longitude to the lutz package [@lutz]. With valid timezones in place, the UTC-stamped firstseen and lastseen columns could be converted to local departure and arrival times.
+
+```{r turnaround-fit, warning = FALSE}
+
+turnaround_times <- flights |>
+  arrange(icao24, firstseen) |>
+  group_by(icao24) |>
+  mutate(turnaround_mins = (as.numeric(firstseen) - lag(as.numeric(lastseen))) / 60) |>
+  ungroup() |>
+  filter(!is.na(turnaround_mins), turnaround_mins > 0, turnaround_mins < 120) |>
+  pull(turnaround_mins)
+
+fit <- MASS::fitdistr(turnaround_times, densfun = "gamma")
+shape_hat <- unname(fit$estimate["shape"])
+rate_hat <- unname(fit$estimate["rate"])
+```
+
+Airplane turnaround time was modeled as a Gamma distribution, which is appropriate for representing "waiting time" processes:
+
+$$
+T \sim \mathrm{Gamma}(\alpha, \beta)
+$$
+
+$$
+f_T(t) = \frac{\beta^\alpha}{\Gamma(\alpha)} t^{\alpha - 1} e^{-\beta t}, 
+\quad t > 0
+$$
+
+For each aircraft, identified by its unique `icao24` transponder code, flights were sorted chronologically and the gap between consecutive flights was calculated as the difference between one departure and its previous arrival. These gaps were filtered to exclude turnaround times exceeding two hours, focusing on turnaround times between subsequent flights instead of overnight stays or longer maintenance stops.
+
+```{r fig-4, fig.cap="Gamma Distribution Fitted on Observed Turnaround Times", echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+
+ggplot(tibble(turnaround_mins = turnaround_times), aes(x = turnaround_mins)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 35, boundary = 0, closed = "left") +
+  stat_function(
+    fun = \(x) dgamma(x, shape = shape_hat, rate = rate_hat),
+    linewidth = 1
+  ) +
+  coord_cartesian(xlim = c(0, 115)) +
+  labs(
+    title = "Turnaround Time Distribution with Fitted Gamma",
+    subtitle = sprintf("Shape = %.2f, Rate = %.2f", shape_hat, rate_hat),
+    x = "Turnaround Time (in Minutes)",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+\pagebreak
+
+## Hub-and-Spoke Carriers
+
+The growth of hub-and-spoke carriers followed airline deregulation in the United States, allowing for structured route networks without government approval processes for additions or changes. These airlines have airports that serve as their main bases, known as "hubs." Nearly every flight they operate either begins or ends at one of these hub airports, with the flights arriving from and departing to their "spokes" around the same time. These turnarounds, known as banks, are peaks of activity that often have passengers connecting to another flight. Such a system allows the airlines to concentrate operations. Previous research has understood many of the nuances involved with these, such as:
+
+-   having a higher optimal flight frequency compared to their point-to-point counterparts [@brueckner2004]
+
+-   taking advantage of economies of scale [@brueckner2004]
+
+-   giving market power to airlines that have hubs at airports [@borenstein1991]
+
+```{r select-hubs}
+
+target_airlines <- c("AAL", "ASA", "DAL", "UAL")
+
+hub_map <- flights |>
+  mutate(airline = stringr::str_sub(callsign, 1, 3)) |>
+  filter(airline %in% target_airlines) |>
+  count(airline, hub = departure, name = "flight_volume") |>
+  group_by(airline) |>
+  slice_max(order_by = flight_volume, n = 12, with_ties = FALSE) |>
+  ungroup()
+
+own_hubs_tbl <- hub_map |>
+  distinct(airline, dest = hub) |>
+  mutate(is_own_hub = TRUE)
+
+hub_map |>
+  arrange(airline, desc(flight_volume)) |>
+  group_by(airline) |>
+  mutate(rank = row_number()) |>
+  ungroup() |>
+  dplyr::select(airline, rank, hub) |>
+  tidyr::pivot_wider(names_from = airline, values_from = hub) |>
+  arrange(rank) |>
+  dplyr::select(-rank) |>
+  knitr::kable(
+    col.names = c("American (AAL)", "Alaska (ASA)", "Delta (DAL)", "United (UAL)"),
+    caption = "Top 12 Airports for Hub-and-Spoke Airlines by Departure Volume"
+  )
+```
+
+The top twelve airports by number of aircraft movements for each airline were selected as hubs, which is more than the true number as defined by each of the four carriers, but this allows for covering of focus airports (i.e., quasi-hubs which have special point-to-point like flights) by the hub-and-spoke carriers [@simpleflying_focus_cities].
+
+For airlines that did not have this many hubs and focus airports, the simulation results were not affected by this overestimate, since flights between two hubs were scheduled the same way as those between a hub and a spoke.
+
+```{r add-regionals-to-mainlines, warning = FALSE}
+
+regional_flights <- flights |>
+  filter(str_detect(callsign, "^(RPA|SKW)")) |>
+  pivot_longer(c(departure, arrival), names_to = "leg", values_to = "airport") |>
+  inner_join(hub_map, by = c("airport" = "hub")) |>
+  count(icao24, airline, name = "hub_hits") |>
+  group_by(icao24) |>
+  slice_max(hub_hits, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+flights <- flights |>
+  left_join(regional_flights, by = join_by(icao24)) |>
+  mutate(
+    callsign = case_when(
+      !is.na(airline) ~ str_c(airline, str_sub(callsign, 4)),
+      str_sub(callsign, 1, 3) == "EDV" ~ str_c("DAL", str_sub(callsign, 4)),
+      str_sub(callsign, 1, 3) == "QXE" ~ str_c("ASA", str_sub(callsign, 4)),
+      str_sub(callsign, 1, 3) %in% c("JIA", "ENY", "PDT") ~ str_c("AAL", str_sub(callsign, 4)),
+      str_sub(callsign, 1, 3) %in% c("ASH", "UCA", "GJS") ~ str_c("UAL", str_sub(callsign, 4)),
+      TRUE ~ callsign
+    ),
+    airline = str_sub(callsign, 1, 3)
+  ) |>
+  dplyr::select(-hub_hits)
+```
+
+The regional airlines are a core piece of the networks. Some regional airlines fly only for a single larger counterpart (e.g., Endeavor Air for Delta or Horizon Air for Alaska), which were easily matched to their parent company based on industry knowledge [@regional_airlines_partners].
+
+The larger Republic Airways and Skywest Airlines fly for multiple airlines, often with liveried aircraft that only serve a specific hub-and-spoke carrier at all times [@regional_airlines_partners]. To assign these regional carriers' airplanes to their major airline, the number of hubs hits (i.e., takeoffs or landings at the above-determined hubs) for each aircraft was calculated to determine the appropriate marketed carrier.
+
+```{r helper-functions}
+
+op_start <- 5
+op_end <- 23
+
+banks_from_curve_topk_hours <- function(curve_df, op_start = 5, op_end = 23, win = 2, 
+                                        min_banks = 3, max_banks = 6) {
+  x <- curve_df |>
+    arrange(hour) |>
+    mutate(
+      lam_s = slider::slide_dbl(lambda, mean, .before = win, .after = win, .complete = TRUE),
+      prev = lag(lam_s),
+      nextv = lead(lam_s),
+      valley = !is.na(prev) & !is.na(nextv) & lam_s < prev & lam_s < nextv,
+      depth = ((prev + nextv) / 2) - lam_s
+    )
+
+  valleys <- x |> filter(valley) |> arrange(desc(depth))
+
+  n_cuts <- case_when(
+    nrow(valleys) >= (max_banks - 1) ~ (max_banks - 1),
+    nrow(valleys) >= (min_banks - 1) ~ (min_banks - 1),
+    TRUE ~ NA_integer_
+  )
+
+  if (is.na(n_cuts)) {
+    cuts <- seq(op_start, op_end, length.out = min_banks + 1)
+  } else {
+    cuts_mid <- valleys |> slice_head(n = n_cuts) |> pull(hour)
+    cuts <- sort(unique(c(op_start, cuts_mid, op_end)))
+    if (length(cuts) < (min_banks + 1)) {
+      cuts <- seq(op_start, op_end, length.out = min_banks + 1)
+    }
+  }
+
+  tibble::tibble(
+    start_hour = cuts[-length(cuts)],
+    end_hour = cuts[-1],
+    bank_idx = seq_along(cuts[-1]),
+    bank = paste0("Bank ", bank_idx),
+    start_min = start_hour * 60,
+    end_min = end_hour * 60,
+    n_banks = length(cuts) - 1
+  )
+}
+
+fit_curve <- function(count_df, op_start = 5, op_end = 23) {
+  count_df <- count_df |>
+    dplyr::mutate(hour = hour %% 24)
+
+  fit <- mgcv::gam(
+    y ~ s(hour, bs = "cc", k = 10),
+    family = poisson(),
+    data = count_df,
+    method = "REML",
+    knots = list(hour = c(0, 24))
+  )
+
+  tibble::tibble(hour = 0:23) |>
+    dplyr::mutate(
+      lambda_raw = predict(fit, newdata = tibble::tibble(hour = hour), type = "response"),
+      lambda = ifelse(hour < op_start | hour >= op_end, 0, lambda_raw)
+    ) |>
+    dplyr::select(hour, lambda)
+}
+
+connect_score <- function(t, arr_vec, mct = 35, max_ct = 180) {
+  t <- as.integer(t) %% 1440
+  lo <- t - max_ct
+  hi <- t - mct
+  rng <- seq(lo, hi)
+  rng_mod <- (rng %% 1440) + 1
+  sum(arr_vec[rng_mod])
+}
+
+optimize_slots_in_bank <- function(start_min, end_min, n_slots, arr_vec,
+                                   mct = 35, max_ct = 180, buffer = 5, 
+                                   min_sep = 4, search_radius = 30, passes = 2) {
+  if (n_slots <= 0) return(integer())
+  lo <- start_min + buffer
+  hi <- end_min - buffer
+  if (hi <= lo) return(rep(round((start_min + end_min) / 2), n_slots))
+
+  slots <- if (n_slots == 1) {
+    round((lo + hi) / 2)
+  } else {
+    round(seq(lo, hi, length.out = n_slots))
+  }
+
+  for (p in seq_len(passes)) {
+    for (i in seq_along(slots)) {
+      left_bound <- if (i == 1) lo else slots[i - 1] + min_sep
+      right_bound <- if (i == length(slots)) hi else slots[i + 1] - min_sep
+      if (right_bound < left_bound) next
+
+      cand_lo <- max(left_bound, slots[i] - search_radius)
+      cand_hi <- min(right_bound, slots[i] + search_radius)
+      cands <- cand_lo:cand_hi
+
+      scores <- vapply(cands, \(tt) connect_score(tt, arr_vec, mct = mct, max_ct = max_ct), numeric(1))
+      slots[i] <- cands[which.max(scores)]
+    }
+  }
+  slots
+}
+
+allocate_dests_bank <- function(n_slots, dests, probs) {
+  if (n_slots <= 0) return(character())
+  if (is.null(dests) || length(dests) == 0) return(rep(NA_character_, n_slots))
+
+  probs <- as.numeric(probs)
+  probs[is.na(probs) | probs < 0] <- 0
+  if (sum(probs) <= 0) return(rep(NA_character_, n_slots))
+  probs <- probs / sum(probs)
+
+  exp_ct <- n_slots * probs
+  base <- floor(exp_ct)
+  rem <- n_slots - sum(base)
+  frac <- exp_ct - base
+
+  if (rem > 0) {
+    add_idx <- order(frac, decreasing = TRUE)[seq_len(rem)]
+    base[add_idx] <- base[add_idx] + 1L
+  }
+
+  vec <- rep(dests, base)
+  sample(vec, size = n_slots, replace = FALSE)
+}
+
+get_duration_safe <- function(al, dep, arr, r_block) {
+  match_row <- r_block |> filter(airline == al, departure == dep, arrival == arr)
+  if (nrow(match_row) > 0) return(as.integer(match_row$dur_sec_med))
+  return(as.integer(3600))
+}
+
+add_coords_11cols <- function(tbl, airports_ref) {
+  dep_coords <- airports_ref |> 
+    dplyr::select(ICAO, dep_latitude = lat, dep_longitude = lon) |> distinct()
+  arr_coords <- airports_ref |> 
+    dplyr::select(ICAO, arr_latitude = lat, arr_longitude = lon) |> distinct()
+  
+  tbl |> 
+    left_join(dep_coords, by = c("departure" = "ICAO")) |> 
+    left_join(arr_coords, by = c("arrival" = "ICAO")) |> 
+    dplyr::select(
+      any_of(c("airline", "callsign", "tail_number", "departure", "arrival", 
+               "day_of_week", "departure_time", "arrival_time")),
+      dep_latitude, dep_longitude, arr_latitude, arr_longitude
+    )
+}
+```
+
+To account for differences in banking across hubs, a Generalized Additive Model with a cyclic cubic spline was fit to hourly flight counts [@bates2019_gams_timeseries]. This gives a smooth Poisson rate curve across the day for each airline-airport pairing, with the response variable $Y_h$ being the observed flight count and $\lambda_h$ as the expected number of flights for hour $h$ (0 to 23) of the day. Since the spline is cyclic, the function wraps smoothly from hour 23 back to hour 0:
+
+$$
+Y_h \sim \mathrm{Poisson}(\lambda_h), \quad h \in \{0,1,\dots,23\}
+$$
+
+$$
+\log \lambda_h = \beta_0 + s(h)
+$$
+
+This curve is passed to an algorithm that identifies the peaks and troughs throughout the day, with the deepest valleys serving as cut points that partition the operating day into departure banks and mimic the waves of hub-and-spoke scheduling.
+
+```{r prepare-hub-spoke-data}
+
+wave_carriers <- c("DAL", "AAL", "ASA", "UAL")
+
+valid_hubs <- hub_map |>
+  filter(airline %in% wave_carriers) |>
+  distinct(airline, hub)
+
+flights_wave <- flights |>
+  filter(airline %in% wave_carriers) |>
+  mutate(
+    dep_local = lubridate::with_tz(firstseen, departure_tz),
+    arr_local = lubridate::with_tz(lastseen, arrival_tz),
+    dep_minute = lubridate::hour(dep_local) * 60 + lubridate::minute(dep_local),
+    arr_minute = lubridate::hour(arr_local) * 60 + lubridate::minute(arr_local),
+    dep_hour = lubridate::hour(dep_local),
+    arr_hour = lubridate::hour(arr_local),
+    dep_date = as.Date(dep_local),
+    arr_date = as.Date(arr_local)
+  )
+
+dep_counts <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  count(airline, hub = departure, hour = dep_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = 0:23, fill = list(y = 0))
+
+arr_counts <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  count(airline, hub = arrival, hour = arr_hour, name = "y") |>
+  complete(nesting(airline, hub), hour = 0:23, fill = list(y = 0))
+
+dep_curves <- dep_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) fit_curve(.x)) |>
+  ungroup()
+
+dep_banks <- dep_counts |>
+  group_by(airline, hub) |>
+  group_modify(\(.x, .y) {
+    curve <- fit_curve(.x)
+    banks_from_curve_topk_hours(curve, win = 2, min_banks = 3, max_banks = 6)
+  }) |>
+  ungroup()
+
+route_block <- flights_wave |>
+  mutate(dur_sec = as.numeric(difftime(lastseen, firstseen, units = "secs"))) |>
+  filter(is.finite(dur_sec), dur_sec > 10 * 60, dur_sec < 10 * 3600) |>
+  group_by(airline, departure, arrival) |>
+  summarise(n = n(), dur_sec_med = median(dur_sec, na.rm = TRUE), .groups = "drop")
+```
+
+```{r fig-5, fig.cap="Departure Cyclic Splines at Selected US Airports", fig.height=4}
+
+top_hubs <- dep_counts |>
+  group_by(hub) |>
+  summarise(total = sum(y), .groups = "drop") |>
+  slice_max(total, n = 12) |>
+  pull(hub)
+
+rects <- dep_banks |> filter(hub %in% top_hubs) |>
+  mutate(xmin = start_hour, xmax = end_hour, ymin = -Inf, ymax = Inf)
+
+ggplot() +
+  geom_rect(data = rects, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, group = bank_idx),
+            alpha = 0.10, inherit.aes = FALSE) +
+  geom_col(data = dep_counts |> filter(hub %in% top_hubs),
+           aes(x = hour, y = y, group = airline), alpha = 0.30, width = 0.9, position = "identity") +
+  geom_line(data = dep_curves |> filter(hub %in% top_hubs),
+            aes(x = hour, y = lambda, group = airline, color = airline), linewidth = 0.9) +
+  scale_x_continuous(breaks = seq(0, 24, by = 6)) +
+  facet_wrap(~ hub, scales = "free_y") +
+  labs(title = "Departures Banks For Hubs Airports", x = "Local hour", 
+       y = "Observed Departures/Estimated Intensity") +
+  scale_color_manual(
+    values = c(
+      "AAL" = "black",
+      "UAL" = "darkblue",
+      "ASA" = "green",
+      "DAL" = "red"
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r fig-6, fig.cap="Departure Bank Breakdown for Seattle–Tacoma International Airport"}
+
+rects_ksea <- rects |>
+  dplyr::select(airline, bank_idx, xmin, xmax, ymin, ymax)
+
+dep_counts_ksea_banked <- dep_counts |>
+  filter(hub == "KSEA", airline %in% c("ASA", "DAL")) |>
+  left_join(
+    rects_ksea |> dplyr::select(airline, bank_idx, xmin, xmax),
+    join_by(airline, hour >= xmin, hour <= xmax)
+  ) |>
+  filter(!is.na(bank_idx))
+
+dep_curves_ksea_banked <- dep_curves |>
+  filter(hub == "KSEA", airline %in% c("ASA", "DAL")) |>
+  left_join(
+    rects_ksea |> dplyr::select(airline, bank_idx, xmin, xmax),
+    join_by(airline, hour >= xmin, hour <= xmax)
+  ) |>
+  filter(!is.na(bank_idx))
+
+ggplot() +
+  geom_rect(
+    data = rects_ksea,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, group = bank_idx),
+    alpha = 0.10, inherit.aes = FALSE
+  ) +
+  geom_col(
+    data = dep_counts_ksea_banked,
+    aes(x = hour, y = y),
+    alpha = 0.30, width = 0.9, position = "identity"
+  ) +
+  geom_line(
+    data = dep_curves_ksea_banked,
+    aes(x = hour, y = lambda, color = airline),
+    linewidth = 0.9
+  ) +
+  scale_color_manual(values = c("ASA" = "green", 
+                                "DAL" = "red")
+                     ) +
+  scale_x_continuous(breaks = seq(0, 24, by = 6)) +
+  facet_grid(airline ~ bank_idx, scales = "free_y") +
+  labs(
+    title = "SEA Departures Banks By Airline",
+    x = "Local Hour",
+    y = "Observed Departures / Estimated Intensity", 
+    color = "Airline"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+The creation of a schedule for hub-and-spoke carriers first estimates demand by calculating how many departures each airline needs per bank at each hub on each day of the week. This count is based on the 50th percentile of the observed daily counts to target an intermediate day out among three weeks of data used.
+
+For each airline-hub pair, the departures are assigned to their nearest departure bank based on temporal distance. Then, within these banks, the destinations are assigned to slots by proportional assignment: each destination receives a number of slots proportional to its observed frequency, with fractional remainders resolved by a largest-remainder rounding scheme.
+
+Departure slots within banks are optimized using a connectivity scoring function, which calculates how many arriving flights $a_\tau$ at each arrival time $\tau$ that would fall within a feasible connection window between the minimum connection time of 35 minutes and the maximum connection time of 180 minutes. For each candidate departure time, the optimizer starts from initial evenly spaced slots to avoid congestion, calculates the score for candidate departure times within a local search radius, and then selects the spot with the local maximum score at that step:
+
+$$
+C(t) = \sum_{\tau = t - \text{maxCT}}^{t - \text{MCT}} a_\tau
+$$
+
+$$
+t^* = \arg\max_{t \in \mathcal{B}} C(t)
+$$
+
+```{r generate-7-day-hub-spoke-schedule}
+
+hub_dep_obs_daily <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  left_join(dep_banks |> dplyr::select(airline, hub, bank, bank_idx, start_min, end_min),
+            by = c("airline", "departure" = "hub")) |>
+  group_by(airline, departure, icao24, firstseen) |> 
+  mutate(
+    in_bank = !is.na(start_min) & dep_minute >= start_min & dep_minute < end_min,
+    dist_to_start = abs(dep_minute - start_min),
+    dist_to_end = abs(dep_minute - end_min),
+    min_dist = pmin(dist_to_start, dist_to_end, na.rm = TRUE)
+  ) |>
+  slice_min(order_by = if_else(in_bank, 0, min_dist), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(hub = departure, day_name = lubridate::wday(dep_date, label = TRUE, abbr = FALSE)) |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min, day_name, dep_date) |>
+  summarise(n_day = n(), .groups = "drop") |>
+  group_by(airline, hub, bank, bank_idx, start_min, end_min, day_name) |>
+  summarise(n_dep = as.integer(ceiling(stats::quantile(n_day, 0.5, na.rm = TRUE))), .groups = "drop") |>
+  mutate(n_dep = pmax(0L, n_dep))
+
+route_shares <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "departure" = "hub")) |>
+  mutate(
+    hub = departure, 
+    dest = arrival
+  ) |>
+  # Assign to nearest bank
+  left_join(dep_banks |> select(airline, hub, bank, bank_idx, start_min, end_min),
+            by = c("airline", "hub")) |>
+  group_by(airline, departure, icao24, firstseen) |>
+  mutate(
+    in_bank = !is.na(start_min) & dep_minute >= start_min & dep_minute < end_min,
+    dist_to_start = abs(dep_minute - start_min),
+    dist_to_end = abs(dep_minute - end_min),
+    min_dist = pmin(dist_to_start, dist_to_end, na.rm = TRUE)
+  ) |>
+  slice_min(order_by = if_else(in_bank, 0, min_dist), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  # Join the hub list
+  count(airline, hub, bank, bank_idx, dest, name = "n") |>
+  group_by(airline, hub, bank, bank_idx) |>
+  mutate(p = n / sum(n)) |>
+  ungroup()
+
+route_dist <- route_shares |>
+  group_by(airline, hub, bank, bank_idx) |>
+  summarise(dests = list(dest), probs = list(p), .groups = "drop")
+
+arr_vec_tbl <- flights_wave |>
+  inner_join(valid_hubs, by = c("airline", "arrival" = "hub")) |>
+  mutate(hub = arrival) |>
+  group_by(airline, hub) |>
+  summarise(
+    n_days = n_distinct(arr_date),
+    arr_vec = list(tabulate((arr_minute %% 1440) + 1L, nbins = 1440) / pmax(1L, n_days)),
+    .groups = "drop"
+  )
+
+generate_daily_schedule <- function(target_day, day_index, obs_data, routes_data, arr_vec_data) {
+  day_obs <- obs_data |> filter(day_name == target_day)
+  if (nrow(day_obs) == 0) return(tibble())
+
+  day_offset <- (day_index - 1L) * 24L * 60L * 60L
+
+  day_schedule <- day_obs |>
+    left_join(arr_vec_data, by = c("airline", "hub")) |>
+    mutate(
+      slot_minute = purrr::pmap(
+        list(start_min, end_min, n_dep, arr_vec),
+        \(.s, .e, .n, .v) optimize_slots_in_bank(.s, .e, .n, .v, mct = 35, max_ct = 180,
+                                                   buffer = 5, min_sep = 4, search_radius = 30, passes = 2)
+      )
+    ) |>
+    tidyr::unnest(slot_minute) |>
+    mutate(slot_minute = as.integer(round(slot_minute))) |>
+    group_by(airline, hub, bank, bank_idx) |>
+    mutate(slot_idx = row_number()) |>
+    ungroup() |>
+    left_join(routes_data, by = c("airline", "hub", "bank", "bank_idx")) |>
+    group_by(airline, hub, bank, bank_idx) |>
+    mutate(
+      dest_vec = list(allocate_dests_bank(first(n_dep), dests[[1]], probs[[1]])),
+      dest = dest_vec[[1]][slot_idx]
+    ) |>
+    ungroup() |>
+    dplyr::select(-dests, -probs, -dest_vec) |>
+    filter(!is.na(dest))
+
+  base_demand <- day_schedule |>
+    mutate(dep_sec = as.integer(round(slot_minute)) * 60L + day_offset) |>
+    rowwise() |>
+    mutate(duration_out = get_duration_safe(airline, hub, dest, route_block)) |>
+    ungroup() |>
+    transmute(
+      airline,
+      flight_id_base = paste0(airline, "-", hub, "-", bank_idx, "-", row_number()),
+      origin = hub, dest = dest,
+      dep_time = dep_sec,
+      arr_time = dep_sec + duration_out
+    )
+
+  return_demand <- base_demand |>
+    left_join(own_hubs_tbl, by = c("airline", "dest")) |>
+    filter(is.na(is_own_hub)) |>
+    select(-is_own_hub) |>
+    mutate(
+      origin_ret = dest,
+      dest_ret   = origin,
+      turnaround_mins = rgamma(n(), shape = shape_hat, rate = rate_hat),
+      dep_time_ret    = arr_time + turnaround_mins * 60
+    ) |>
+    rowwise() |>
+    mutate(duration_in = get_duration_safe(airline, origin_ret, dest_ret, route_block)) |>
+    ungroup() |>
+    transmute(
+      airline,
+      flight_id_base = paste0(flight_id_base, "R"),
+      origin = origin_ret,
+      dest   = dest_ret,
+      dep_time = dep_time_ret,
+      arr_time = dep_time_ret + duration_in
+    )
+
+  bind_rows(base_demand, return_demand) |>
+    mutate(day_of_week = target_day) |>
+    arrange(dep_time)
+}
+
+set.seed(115)
+
+fleet_state <- tibble(airline = character(), tail_num = character(), loc = character(), ready_at = integer())
+tail_counter <- 1
+turn_mins_draw <- pmax(25, rgamma(1, shape = shape_hat, rate = rate_hat))
+
+full_week_results <- list()
+days_to_sim <- c("Sunday", "Monday", "Tuesday", "Wednesday",
+                 "Thursday", "Friday", "Saturday", "Sunday")
+
+fleet_state <- tibble(
+  airline = character(),
+  tail_num = character(),
+  loc = character(),
+  ready_at = integer()
+)
+
+tail_counter <- 1
+full_week_results <- list()
+
+for (d_idx in seq_along(days_to_sim)) {
+
+  current_day <- days_to_sim[d_idx]
+
+  daily_flights <- generate_daily_schedule(
+    current_day,
+    d_idx,
+    hub_dep_obs_daily,
+    route_dist,
+    arr_vec_tbl
+  )
+
+  assigned_day <- list()
+  daily_flights <- daily_flights |> arrange(dep_time)
+
+  if (nrow(daily_flights) > 0) {
+
+    for (i in seq_len(nrow(daily_flights))) {
+
+      flight <- daily_flights[i, ]
+
+      candidates <- fleet_state |>
+        filter(
+          airline == flight$airline,
+          loc == flight$origin,
+          ready_at <= flight$dep_time
+        ) |>
+        arrange(desc(ready_at))
+
+      if (nrow(candidates) > 0) {
+
+        chosen_tail <- candidates$tail_num[1]
+
+      } else {
+
+        chosen_tail <- paste0(
+          "N",
+          stringr::str_pad(tail_counter, 5, pad = "0"),
+          flight$airline
+        )
+
+        tail_counter <- tail_counter + 1
+      }
+
+      # Draw turnaround from fitted Gamma (in minutes → convert to seconds)
+      turn_mins_draw <- pmax(
+        25,
+        rgamma(1, shape = shape_hat, rate = rate_hat)
+      )
+
+      fleet_state <- fleet_state |>
+        filter(tail_num != chosen_tail) |>
+        add_row(
+          airline = flight$airline,
+          tail_num = chosen_tail,
+          loc = flight$dest,
+          ready_at = flight$arr_time +
+                     as.integer(round(turn_mins_draw * 60))
+        )
+
+      assigned_day[[i]] <- flight |>
+        mutate(tail_number = chosen_tail)
+    }
+  }
+
+  full_week_results[[d_idx]] <- bind_rows(assigned_day)
+}
+
+seconds_per_day <- 24 * 60 * 60
+
+final_week_schedule <- bind_rows(full_week_results) |>
+  arrange(dep_time) |>
+  filter(dep_time >= seconds_per_day) |>   # remove first 24h
+  mutate(
+    dep_time = dep_time - seconds_per_day,
+    arr_time = arr_time - seconds_per_day
+  )
+
+final_formatted <- final_week_schedule |>
+  rename(departure = origin, arrival = dest) |>
+  mutate(
+    callsign = paste0(airline, stringr::str_sub(tail_number, 2, 5)),
+    departure_time = hms::as_hms(dep_time %% seconds_per_day),
+    arrival_time   = hms::as_hms(arr_time %% seconds_per_day),
+
+    day_of_week = factor(
+      c("Monday","Tuesday","Wednesday","Thursday",
+        "Friday","Saturday","Sunday")[
+          (dep_time %/% seconds_per_day) + 1
+        ],
+      levels = c("Monday","Tuesday","Wednesday",
+                 "Thursday","Friday","Saturday","Sunday"),
+      ordered = TRUE
+    )
+  ) |>
+  add_coords_11cols(airports_ref = airports_ref) |>
+  mutate(duration = as.numeric(arrival_time - departure_time)) |>
+  arrange(day_of_week, departure_time)
+
+saveRDS(final_formatted, "hub_spoke_schedule.rds")
+```
+
+Scheduled block times are retrieved from an analysis of the empirical flight durations for the same routing. Then, for each outbound flight to a spoke airport, a matching return leg is generated. Return flights are scheduled to depart after a stochastic turnaround time drawn from the previously fitted Gamma distribution, subject to a minimum of 25 minutes. However, hub-to-hub routes do not generate return legs.
+
+The final schedule is produced through a fleet simulation that assigns tail numbers to flights. This simulation maintains a fleet state table that tracks each aircraft's airline, current location, and earliest availability time, with states persisting across days. Assignment is done using a greedy algorithm, selecting the most recently available aircraft, and if no suitable aircraft is available, a new tail number is assigned to the fleet.
+
+The simulation runs for eight days (Sunday through Sunday) to allow the fleet state to stabilize, after which the first 24 hours are subsequently discarded, leaving a Monday-to-Sunday seven-day hub-and-spoke airline schedule.
+
+```{r comparing-hub-spoke}
+
+gen <- final_formatted |>
+  mutate(type = "generated") |>
+  transmute(
+    type, airline,
+    departure, arrival,
+    day_of_week = as.character(day_of_week),
+    dep_minute = as.numeric(departure_time) %/% 60
+  )
+
+obs <- flights |>
+  mutate(airline = str_sub(callsign, 1, 3)) |>
+  filter(airline %in% c("AAL", "ASA", "DAL", "UAL")) |>
+  mutate(
+    dep_date = date(firstseen),
+    type = "observed",
+    day_of_week = as.character(lubridate::wday(dep_date, label = TRUE, abbr = FALSE)),
+    duration_sec = as.numeric(difftime(lastseen, firstseen, units = "secs"))
+  ) |>
+  filter(dep_date < min(dep_date) + 7) |>
+  transmute(
+    type, airline,
+    departure, arrival,
+    day_of_week,
+    dep_minute        # <- add this
+  )
+
+both <- bind_rows(obs, gen)
+```
+
+```{r flight-number-validation}
+
+totals <- both |>
+  count(type, airline, day_of_week, name = "n_flights") |>
+  group_by(type, airline) |>
+  mutate(pct = n_flights / sum(n_flights)) |>
+  ungroup() |>
+  drop_na(day_of_week)
+
+diff_long <- totals |>
+  dplyr::select(type, airline, day_of_week, n_flights, pct) |>
+  tidyr::pivot_wider(
+    names_from = type,
+    values_from = c(n_flights, pct),
+    values_fill = 0
+  ) |>
+  mutate(
+    diff_pct = (n_flights_generated - n_flights_observed) / n_flights_observed,
+  )
+
+diff_pcts <- diff_long |>
+  dplyr::select(`Day of Week` = day_of_week, airline, diff_pct) |>
+  tidyr::pivot_wider(names_from = airline, values_from = diff_pct, values_fill = 0) |>
+  arrange(factor(`Day of Week`, levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+
+diff_pcts |> mutate(across(-`Day of Week`, ~ percent(.x, accuracy = 0.1))) |>
+  knitr::kable(caption = "Percentage Point Differences ($\\text{Generated} - \\text{Observed}$) in Airline-Day Flights")
+```
+
+Data validation shows that the system used to generate the flights produces a very good estimate of the true number of flights operated by the hub-and-spoke airlines on each day of the week. Since the data are based on the 50th percentile of observed—which was used to capture rarer flights that may not have been operated once in the small data sample—the differences below 6% indicate a high-quality process for producing the hub-and-spoke data.
+
+\pagebreak
+
+## Point-to-Point Carriers
+
+For point-to-point carriers, there is less structure in flight scheduling between airports, with no hubs. Such a system is thus more optimized and leaves more vulnerabilities exposed to disruption, as delays or operational issues are less easily absorbed without the centralized coordination and redundancy afforded by economies of scale in hub-and-spoke networks [@brueckner2004].
+
+```{r point-to-point-setup}
+
+ptp_prefix <- c("FFT", "JBU", "NKS", "SWA")
+
+ptp_flights <- all_data |>
+  mutate(
+    airline = stringr::str_sub(callsign, 1, 3),
+    firstseen_utc = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen_utc = lubridate::ymd_hms(lastseen, tz = "UTC"),
+    service_date_utc = as.Date(firstseen_utc)
+  ) |>
+  filter(
+    departure %in% us_airports$ICAO,
+    arrival %in% us_airports$ICAO,
+    departure != arrival,
+    airline %in% ptp_prefix
+  ) |>
+  mutate(
+    duration_s = as.numeric(difftime(lastseen_utc, firstseen_utc, units = "secs")),
+    duration_m = duration_s / 60
+  ) |>
+  filter(is.finite(duration_m), duration_m > 0, duration_m < 24 * 60) |>
+  dplyr::select(airline, callsign, icao24, departure, arrival, firstseen_utc, 
+                lastseen_utc, service_date_utc, duration_m)
+
+spread_midnight_spike_utc <- function(flights_tbl, airlines = c("SWA", "FFT", "NKS", "JBU"),
+                                      max_back_hours = 2L, expected_method = "p50_1to3", seed = 115) {
+  set.seed(seed)
+
+  x <- flights_tbl |>
+    mutate(
+      airline = as.character(airline),
+      firstseen_utc = as.POSIXct(firstseen_utc, tz = "UTC"),
+      lastseen_utc = as.POSIXct(lastseen_utc, tz = "UTC"),
+      service_date_utc = as.Date(firstseen_utc),
+      hour_utc = lubridate::hour(firstseen_utc),
+      .row_id = row_number()
+    )
+
+  hourly <- x |>
+    filter(airline %in% airlines) |>
+    count(airline, service_date_utc, hour_utc, name = "n") |>
+    tidyr::complete(airline, service_date_utc, hour_utc = 0:23, fill = list(n = 0))
+
+  expected <- hourly |>
+    group_by(airline, service_date_utc) |>
+    summarise(
+      n0 = n[hour_utc == 0], n1 = n[hour_utc == 1], n2 = n[hour_utc == 2], n3 = n[hour_utc == 3],
+      expected0 = as.integer(stats::median(c(n1, n2, n3))),
+      excess0 = pmax(0L, n0 - expected0),
+      .groups = "drop"
+    ) |>
+    filter(excess0 > 0)
+
+  if (nrow(expected) == 0) return(x |> dplyr::select(-hour_utc, -.row_id))
+
+  cand <- x |>
+    filter(airline %in% airlines, hour_utc == 0) |>
+    inner_join(expected |> dplyr::select(airline, service_date_utc, excess0),
+               by = c("airline", "service_date_utc"))
+
+  if (nrow(cand) == 0) return(x |> dplyr::select(-hour_utc, -.row_id))
+
+  movers <- cand |>
+    group_by(airline, service_date_utc) |>
+    group_modify(\(.df, .key) {
+      n_move <- min(nrow(.df), .df$excess0[[1]])
+      if (n_move <= 0) return(.df[0, ])
+      dplyr::slice_sample(.df, n = n_move)
+    }) |>
+    ungroup() |>
+    dplyr::select(.row_id)
+
+  if (nrow(movers) == 0) return(x |> dplyr::select(-hour_utc, -.row_id))
+
+  ks <- 1L:max_back_hours
+  probs <- rev(seq_len(max_back_hours))
+  probs <- probs / sum(probs)
+
+  shift_tbl <- movers |> mutate(k = sample(ks, size = n(), replace = TRUE, prob = probs))
+
+  x |>
+    left_join(shift_tbl, by = ".row_id") |>
+    mutate(
+      firstseen_utc = if_else(!is.na(k), firstseen_utc - lubridate::hours(k), firstseen_utc),
+      lastseen_utc = if_else(!is.na(k), lastseen_utc - lubridate::hours(k), lastseen_utc),
+      service_date_utc = as.Date(firstseen_utc)
+    ) |>
+    dplyr::select(-hour_utc, -.row_id, -k)
+}
+
+ptp_flights <- spread_midnight_spike_utc(ptp_flights, airlines = ptp_prefix, 
+                                         max_back_hours = 2, expected_method = "p50_1to3", seed = 115)
+```
+
+The previously discussed midnight spike, due to how the data was stored in the OpenSky Trino database, was artificially addressed here. By comparing the flight count in hour zero (12 AM to 1 AM on a day) against the median of hours one through three for each airline and date. Any excess above that expected baseline is identified, and a random sample of that many flights is selected from the midnight hour and shifted backward by one or two hours (with a bias toward smaller shifts).
+
+```{r point-to-point-simulation}
+
+clean_flights <- all_data |>
+  mutate(
+    airline = stringr::str_sub(callsign, 1, 3),
+    firstseen_utc = lubridate::ymd_hms(firstseen, tz = "UTC"),
+    lastseen_utc = lubridate::ymd_hms(lastseen, tz = "UTC"),
+    duration_min = as.numeric(difftime(lastseen_utc, firstseen_utc, units = "mins"))
+  ) |>
+  filter(
+    departure %in% us_airports$ICAO,
+    arrival %in% us_airports$ICAO,
+    departure != arrival,
+    airline %in% ptp_prefix,
+    duration_min > 20, duration_min < 600
+  )
+
+# Reduce fleet sizes to account for maintenance (15% down)
+fleet_sizes <- clean_flights |>
+  group_by(airline) |>
+  summarise(n_planes = n_distinct(icao24)) |>
+  tibble::deframe() |>
+  purrr::map_int(~max(1, floor(.x * 0.85)))  # 15% reduction for maintenance
+
+ptp_route_block_times <- clean_flights |>
+  group_by(airline, departure, arrival) |>
+  summarise(block_min = as.integer(median(duration_min)), .groups = "drop")
+
+transition_matrix <- clean_flights |>
+  count(airline, departure, arrival, name = "flights") |>
+  group_by(airline, departure) |>
+  mutate(prob = flights / sum(flights)) |>
+  ungroup() |>
+  dplyr::select(airline, origin = departure, dest = arrival, prob)
+
+starting_weights <- clean_flights |>
+  count(airline, departure, name = "weight") |>
+  group_by(airline) |>
+  mutate(prob = weight / sum(weight)) |>
+  ungroup()
+
+# Helper function to check if time is in overnight curfew (11 PM - 5 AM ET)
+is_overnight <- function(time_utc) {
+  time_et <- lubridate::with_tz(time_utc, "America/New_York")
+  hour_et <- lubridate::hour(time_et)
+  hour_et >= 23 | hour_et < 5
+}
+
+simulate_airline <- function(airline_code, n_planes, days = 7) {
+  my_trans <- transition_matrix |> filter(airline == airline_code)
+  my_blocks <- ptp_route_block_times |> filter(airline == airline_code)
+  my_starts <- starting_weights |> filter(airline == airline_code)
+  
+  if (nrow(my_starts) == 0) return(NULL)
+  
+  start_sim <- as.POSIXct("2026-01-01 05:00:00", tz = "UTC")
+  end_sim <- start_sim + lubridate::days(days)
+  
+  fleet <- tibble(
+    tail_number = sprintf("N%04d%s", 1:n_planes, airline_code),
+    airline = airline_code,
+    current_airport = sample(my_starts$departure, n_planes, replace = TRUE, prob = my_starts$prob),
+    next_available = start_sim + lubridate::minutes(sample(0:240, n_planes, replace = TRUE)),
+    daily_flights = 0,  # Track flights per day for crew limits
+    daily_reset = start_sim
+  )
+  
+  schedule_log <- list()
+  for (p in 1:n_planes) {
+    curr_tail <- fleet$tail_number[p]
+    curr_loc <- fleet$current_airport[p]
+    curr_time <- fleet$next_available[p]
+    daily_flight_count <- 0
+    last_reset_day <- lubridate::date(curr_time)
+    plane_legs <- list()
+    
+    while (curr_time < end_sim) {
+      # Reset daily counter at midnight ET
+      current_day <- lubridate::date(lubridate::with_tz(curr_time, "America/New_York"))
+      if (current_day != last_reset_day) {
+        daily_flight_count <- 0
+        last_reset_day <- current_day
+      }
+      
+      # Crew duty limits: max 6 flights per day
+      if (daily_flight_count >= 6) {
+        # Wait until next day 5 AM ET
+        next_day <- lubridate::with_tz(curr_time, "America/New_York") |>
+          lubridate::ceiling_date("day") |>
+          lubridate::force_tz("America/New_York")
+        curr_time <- lubridate::with_tz(next_day + lubridate::hours(5), "UTC")
+        daily_flight_count <- 0
+        next
+      }
+      
+      # Check for overnight curfew - if so, advance to 5 AM ET
+      if (is_overnight(curr_time)) {
+        curr_time_et <- lubridate::with_tz(curr_time, "America/New_York")
+        next_morning <- lubridate::ceiling_date(curr_time_et, "day") + lubridate::hours(5)
+        curr_time <- lubridate::with_tz(next_morning, "UTC")
+        next
+      }
+      
+      routes <- my_trans |> filter(origin == curr_loc)
+      
+      if (nrow(routes) == 0) {
+        curr_loc <- sample(my_starts$departure, 1, prob = my_starts$prob)
+        curr_time <- curr_time + lubridate::hours(4)
+        next
+      }
+      
+      # Weekend schedule reduction: 30% fewer flights on Sat/Sun
+      day_of_week <- lubridate::wday(lubridate::with_tz(curr_time, "America/New_York"))
+      if (day_of_week %in% c(1, 7) && runif(1) < 0.30) {  # 1=Sunday, 7=Saturday
+        curr_time <- curr_time + lubridate::hours(2)
+        next
+      }
+      
+      next_dest <- sample(routes$dest, 1, prob = routes$prob)
+      
+      blk <- my_blocks |> filter(departure == curr_loc, arrival == next_dest) |> pull(block_min)
+      if (length(blk) == 0) blk <- 120
+      
+      dep_time <- curr_time
+      arr_time <- dep_time + lubridate::minutes(blk)
+      
+      # Skip if arrival would be during overnight curfew
+      if (is_overnight(arr_time)) {
+        curr_time <- curr_time + lubridate::hours(1)
+        next
+      }
+      
+      plane_legs[[length(plane_legs) + 1]] <- tibble(
+        airline = airline_code, tail_number = curr_tail,
+        departure = curr_loc, arrival = next_dest,
+        dep_time = dep_time, arr_time = arr_time, duration = blk
+      )
+      
+      daily_flight_count <- daily_flight_count + 1
+      curr_loc <- next_dest
+      
+      turn_mins <- rgamma(1, shape = shape_hat, rate = rate_hat)
+
+      turn_mins <- rgamma(1, shape = shape_hat, rate = rate_hat)
+      curr_time <- arr_time + minutes(as.integer(round(turn_mins)))
+    }
+    schedule_log[[p]] <- bind_rows(plane_legs)
+  }
+  
+  bind_rows(schedule_log)
+}
+
+# Run simulation
+sim_results <- list()
+for (al in names(fleet_sizes)) {
+  sim_results[[al]] <- simulate_airline(al, fleet_sizes[[al]])
+}
+
+full_gen_schedule <- bind_rows(sim_results)
+
+# Rest of your code (unchanged)
+airport_locs_clean <- airport_lookup_1 |> 
+  transmute(ICAO = ICAO, lat = latitude, lon = longitude) |> 
+  filter(!is.na(lat), !is.na(lon)) |> 
+  distinct(ICAO, .keep_all = TRUE)
+
+point_to_point_schedule <- full_gen_schedule |>
+  mutate(
+    dep_time_et = lubridate::with_tz(dep_time, "America/New_York"),
+    arr_time_et = lubridate::with_tz(arr_time, "America/New_York")
+  ) |>
+  filter(dep_time_et < as.POSIXct("2026-01-08", tz = "America/New_York")) |>
+  mutate(
+    day_of_week = factor(weekdays(dep_time_et), 
+                         levels = c("Monday", "Tuesday", "Wednesday", "Thursday", 
+                                    "Friday", "Saturday", "Sunday"), ordered = TRUE),
+    callsign = paste0(airline, str_sub(tail_number, 2, 5)),
+    departure_time = hms::as_hms(dep_time_et),
+    arrival_time = hms::as_hms(arr_time_et),
+    duration = as.numeric(duration * 60)
+  ) |>
+  left_join(airport_locs_clean |> rename(dep_latitude = lat, dep_longitude = lon), 
+            by = c("departure" = "ICAO")) |>
+  left_join(airport_locs_clean |> rename(arr_latitude = lat, arr_longitude = lon), 
+            by = c("arrival" = "ICAO")) |>
+  dplyr::select(
+    airline, callsign, tail_number, departure, arrival,
+    day_of_week, departure_time, arrival_time, duration,
+    dep_latitude, dep_longitude, arr_latitude, arr_longitude
+  ) |>
+  arrange(day_of_week, departure_time)
+
+saveRDS(point_to_point_schedule, "point_to_point_schedule.rds")
+```
+
+Each aircraft for point-to-point carriers is treated as an independent agent traversing a Markov chain of routes [@polhemus1980]. First, it extracts fleet sizes from the observed data by counting unique transponder codes per airline, and then reduces them by 15% to account for aircraft unavailability due to scheduled maintenance, unscheduled repairs, and reserve capacity. There are also overnight curfews between midnight and 5 AM, a daily flight cap of 6 for crew duty limits, and weekend schedule reductions with a 30% chance of skipping a departure. Then, the function computes median block times for every route and builds a transition matrix $P_{ij}^{(a)}$ capturing the probability of flying to each destination airport i given a current airport j for each airline a, with current position $X_n$. This is based on the historical data for those variables in $N_{ij}^{(a)}$ over all k airports:
+
+$$
+P_{ij}^{(a)} = \Pr(X_{n+1} = j \mid X_n = i, \text{ airline } a)
+= \frac{N_{ij}^{(a)}}{\sum_k N_{ik}^{(a)}}
+$$
+
+Each simulated aircraft starts at a randomly chosen airport weighted by the observed departure frequency. Then, each repeatedly samples its next destination from the transition matrix, flies the median block time, turns around in 45 minutes, and continues until the seven-day simulation window expires.
+
+```{r combine-schedules}
+
+schedule <- bind_rows(final_formatted, point_to_point_schedule)
+```
+
+\pagebreak
+
+## Network Simulation
+
+The pseudo-data produced for the hub-and-spoke and point-to-point carriers is used for the airplanes in the network simulation.
+
+The focus on delay propagation at an airport can be assessed using a few potential measures. Based on the literature, the key evaluation metrics are of Total System Delay, which adds up the propagated delay, $d$, of all flights $f$ in the system, or through a delay multiplier, which divides the change in Total System Delay by the primary delay injected to the system, $D_0$ [@ahmadbeygi2008] [@beatty2016]:
+
+$$
+\mathrm{TSD} = \sum_{f \in \mathcal{F}} d_f
+$$
+
+$$
+\mathrm{DM} = 
+\frac{\mathrm{TSD}_{\text{disrupted}} - \mathrm{TSD}_{\text{baseline}}}
+{D_0}
+$$
+
+```{r simulation-settings}
+
+sim_config <- list(
+  sim_days = 7,
+  time_step_minutes = 1,
+  
+  capacity = list(
+    large_hub = 90,
+    medium_hub = 60,
+    small_hub = 40,
+    non_hub = 20
+  ),
+  turnaround = list(
+    mean = shape_hat / rate_hat,
+    shape = shape_hat,
+    rate = rate_hat
+  ),
+  
+  delays = list(
+    carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+    nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+    weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+  ),
+  
+  n_replications = 30,
+  seed_base = 115
+)
+```
+
+Airports are one of the agents in the complex air transportation system. Among the limitations they present, the most critical is in runway operations, which are finite and capacity-constrained for landings and takeoffs. Runway capacity is influenced by physical infrastructure and can be further influenced by weather conditions and air traffic control procedures. For the baseline number of operations, the daily count was used. There is a slot request system in place that enforces capacity by calculating the minimum required separation when a flight requests a departure or arrival slot at a specific airport and time. When demand exceeds capacity, queuing delays are needed to meet timing requirements.  Other researchers have gone further into runway capacity implementations, but this introduces a unique tie-in to other delays [@gupta2013_parallel_runway].
+
+```{r airport-classifier}
+
+classify_airports <- function(schedule) {
+  # 1. Calculate peak hourly operations
+  deps <- schedule |>
+    mutate(hour = as.numeric(departure_time) %/% 3600) |>
+    count(airport = departure, day_of_week, hour, name = "hourly_ops")
+
+  arrs <- schedule |>
+    mutate(hour = as.numeric(arrival_time) %/% 3600) |>
+    count(airport = arrival, day_of_week, hour, name = "hourly_ops")
+
+  peak_hourly_traffic <- bind_rows(deps, arrs) |>
+    group_by(airport, day_of_week, hour) |>
+    summarise(hourly_ops = sum(hourly_ops), .groups = "drop") |>
+    group_by(airport) |>
+    summarize(max_hourly_ops = max(hourly_ops), .groups = "drop")
+
+  # 2. Join back to the daily/weekly stats
+  airport_traffic <- schedule |>
+    pivot_longer(cols = c(departure, arrival), values_to = "airport") |>
+    count(airport, name = "weekly_ops") |>
+    mutate(daily_ops = weekly_ops / 7) |>
+    left_join(peak_hourly_traffic, by = "airport")
+
+  # 3. Apply classification
+  airport_traffic |>
+    mutate(
+      hub_class = case_when(
+        daily_ops >= 400 ~ "large_hub",
+        daily_ops >= 200 ~ "medium_hub",
+        daily_ops >= 50  ~ "small_hub",
+        TRUE ~ "non_hub"
+      ),
+      capacity_per_hour = max_hourly_ops,
+      lambda = pmax(max_hourly_ops, 15)
+    ) |>
+    arrange(desc(max_hourly_ops))
+}
+```
+
+```{r runway-manager}
+
+initialize_airport_state <- function(airport_info) {
+  airport_info |>
+    mutate(
+      last_departure = 0,
+      last_arrival = 0
+    ) |>
+    dplyr::select(airport, hub_class, capacity_per_hour, 
+           last_departure, last_arrival)
+}
+
+request_slot <- function(airport_state, airport, requested_time) {
+  idx <- which(airport_state$airport == airport)
+  if (length(idx) == 0) {
+    return(list(granted_time = requested_time, queue_delay = 0))
+  }
+  
+  capacity <- airport_state$capacity_per_hour[idx]
+  min_separation <- 60 / max(1, capacity)
+  
+  last_op <- max(airport_state$last_departure[idx], 
+                 airport_state$last_arrival[idx])
+  earliest_available <- max(requested_time, last_op + min_separation)
+  
+  queue_delay <- earliest_available - requested_time
+  
+  list(granted_time = earliest_available, queue_delay = queue_delay)
+}
+```
+
+Each delay function, of carrier, air traffic (National Airspace System/NAS), and weather determines which flights are affected based on a Bernoulli trial and generated on different distribution types. Unlike the distribution of turnarounds, the delay distribution decisions were based on previous research rather than the data, which was considered the baseline. The research of Novianingsih and Hadianti showed, for real flight data, that delay duration was best modeled by a log-normal distribution [@novianingsih2016].
+
+Thus, a log-normal distribution was fit to carriers to capture the right tails, while Gamma distributions for NAS and weather captured their more “time until success” structure. The baseline version for testing had carrier delays set to 8%, National Airspace System to 5%, and weather delays to 3%, on general expectations informed by personal experience. All delays are rounded to whole minutes and capped at a realistic three-hour limit.
+
+```{r delay-functions}
+
+generate_carrier_delay <- function(n) {
+  delays <- rep(0, n)
+  affected <- runif(n) < sim_config$delays$carrier$prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rlnorm(
+      sum(affected),
+      meanlog = sim_config$delays$carrier$meanlog,
+      sdlog = sim_config$delays$carrier$sdlog
+    )
+  }
+  pmin(round(delays), 180)
+}
+
+generate_nas_delay <- function(n) {
+  delays <- rep(0, n)
+  affected <- runif(n) < sim_config$delays$nas$prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rgamma(
+      sum(affected),
+      shape = sim_config$delays$nas$shape,
+      rate = sim_config$delays$nas$rate
+    )
+  }
+  pmin(round(delays), 180)
+}
+
+generate_weather_delay <- function(n) {
+  delays <- rep(0, n)
+  affected <- runif(n) < sim_config$delays$weather$prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rgamma(
+      sum(affected),
+      shape = sim_config$delays$weather$shape,
+      rate = sim_config$delays$weather$rate
+    )
+  }
+  pmin(round(delays), 180)
+}
+
+generate_turnaround <- function(n) {
+  round(rgamma(n, 
+               shape = sim_config$turnaround$shape, 
+               rate = sim_config$turnaround$rate))
+}
+
+inject_disruption <- function(schedule, airport_info, 
+                              target_airport, 
+                              disruption_duration = 120,
+                              seed = 115) {
+  
+  baseline <- run_simulation(schedule, airport_info, seed)
+  baseline_tsd <- sum(baseline$total_delay)
+  
+  schedule_disrupted <- schedule |>
+    mutate(
+      departure_time = if_else(
+        departure == target_airport,
+        departure_time + disruption_duration,
+        departure_time
+      )
+    )
+  
+  disrupted <- run_simulation(schedule_disrupted, airport_info, seed)
+  disrupted_tsd <- sum(disrupted$total_delay)
+  
+  list(
+    airport = target_airport,
+    injected_delay = disruption_duration * sum(schedule$departure == target_airport),
+    baseline_tsd = baseline_tsd,
+    disrupted_tsd = disrupted_tsd,
+    incremental_tsd = disrupted_tsd - baseline_tsd,
+    delay_multiplier = (disrupted_tsd - baseline_tsd) / 
+                       (disruption_duration * sum(schedule$departure == target_airport))
+  )
+}
+```
+
+```{r theoretical-risk}
+
+calculate_theoretical_airport_risk <- function(schedule, airport_info, sd_service_min = 0.5) {
+  
+  # 1. Extract demand from your schedule
+  # We look at the actual number of scheduled departures to get the true lambda
+  demand_stats <- schedule |>
+    group_by(departure) |>
+    summarise(
+      weekly_flights = n(),
+      daily_lambda_hr = weekly_flights / (7 * 18), # Assuming 18-hour ops day
+      .groups = "drop"
+    )
+  
+  # 2. Join with capacity and calculate M/G/1 parameters
+  risk_profile <- demand_stats |>
+    left_join(airport_info, by = c("departure" = "airport")) |>
+    mutate(
+      lambda = daily_lambda_hr / 60,       # Arrivals per minute
+      mu = capacity_per_hour / 60,         # Service capacity per minute
+      rho = lambda / mu,                   # Utilization
+      mean_s = 1 / mu,                     # Mean service time
+      var_s = sd_service_min^2             # Variance of service
+    ) |>
+    filter(rho > 0) |>
+    mutate(
+      # Expected Queueing Delay (P-K Formula)
+      expected_value_delay = if_else(rho < 1, 
+        (lambda * (var_s + mean_s^2)) / (2 * (1 - rho)), 
+        NA_real_),
+      
+      # Variance of Queueing Delay
+      # Formula for Var(Wq) in M/G/1 systems
+      expected_variance_delay = if_else(rho < 1,
+        ((lambda * (mu^-3)) / (3 * (1 - rho))) + 
+        ((lambda^2 * (var_s + mean_s^2)^2) / (4 * (1 - rho)^2)),
+        NA_real_)
+    ) |>
+    # Add a "Fragility Index" (Variance to Mean ratio)
+    mutate(fragility_index = sqrt(expected_variance_delay) / expected_value_delay) |>
+    arrange(desc(rho))
+
+  return(risk_profile)
+}
+
+# 1. Define airport_info globally
+airport_info <- classify_airports(final_formatted)
+
+theoretical_results <- calculate_theoretical_airport_risk(final_formatted, airport_info)
+```
+
+The simulation creates the foundation for airport-level statistics. Using flight rates, the function estimates flight demand intensity (lambda, $\lambda$). This demand is then benchmarked against each airport's service capacity (mu, $\mu$) to calculate utilization (rho, $\rho$), which represents the proportion of available capacity being consumed by scheduled operations:
+
+$$
+\rho = \frac{\lambda}{\mu}
+$$
+
+Specifically, the heart of this analysis lies in the application of the Pollaczek-Khinchine formula for M/G/1 queuing systems, which captures the reality that airport service times vary even when arrivals follow a relatively predictable pattern [@kasteridis2001]. These formulas compute the expected value and variance of waiting time in the queue, $W_q$, using the above rho, $\rho$, lambda, $\lambda$, and mu, $\mu$, along with the second moment of service time, ${E}[S^2]$:
+
+$$
+\mathbb{E}[W_q] = \frac{\lambda \, \mathbb{E}[S^2]}{2(1 - \rho)}
+$$
+
+$$
+\mathrm{Var}(W_q) = 
+\frac{\lambda}{3\mu^{3}(1 - \rho)} 
++ 
+\frac{\lambda^2 ({E}[S^2])^2}{4(1 - \rho)^2}
+$$
+
+The variance calculation includes a section that accounts for the randomness in service times and the compounding effect of utilization, with airports operating closer to capacity experiencing exponentially higher delay variance.
+
+This leads to the fragility measure for each airport 𝑖, which compares the standard deviation to the mean delay to identify airports where small movements in demand or capacity can trigger relatively large delays.
+
+$$
+\mathrm{F}_i = \frac{\sqrt{\mathbb{V}[W_{q,i}]}}{\mathbb{E}[W_{q,i}]}
+$$
+
+```{r network-risk}
+
+calculate_network_weighted_risk <- function(schedule, theoretical_results) {
+  
+  # 1. Calculate the Transition Matrix (P)
+  transitions <- schedule |>
+    count(departure, arrival) |>
+    group_by(departure) |>
+    mutate(prob = n / sum(n)) |>
+    ungroup()
+  
+  # 2. Calculate "Downstream Potential" (The Multiplier)
+  downstream_counts <- schedule |>
+    group_by(tail_number, day_of_week) |>
+    arrange(departure_time) |>
+    mutate(flights_remaining = n() - row_number()) |>
+    ungroup() |>
+    group_by(departure) |>
+    summarise(avg_downstream_impact = mean(flights_remaining), .groups = "drop")
+  
+  # 3. Calculate Hub Centrality via PageRank
+  g <- igraph::graph_from_data_frame(
+    schedule |> count(departure, arrival),
+    directed = TRUE
+  )
+  igraph::E(g)$weight <- igraph::E(g)$n
+  
+  centrality <- igraph::page_rank(g, directed = TRUE, weights = igraph::E(g)$weight)$vector
+  hub_scores <- tibble(
+    departure = names(centrality),
+    hub_centrality = centrality / mean(centrality)
+  )
+  
+  # Helper for min-max normalization
+  min_max <- function(x) {
+    rng <- range(x, na.rm = TRUE)
+    if (rng[2] == rng[1]) return(rep(0, length(x)))
+    (x - rng[1]) / (rng[2] - rng[1])
+  }
+  
+  # 4. Combine Local Delay, Downstream Potential, and Hub Centrality
+  network_risk <- theoretical_results |>
+    left_join(downstream_counts, by = c("departure" = "departure")) |>
+    left_join(hub_scores, by = "departure") |>
+    mutate(
+      # Scale each metric by hub centrality
+      expected_value_delay = expected_value_delay,
+      downstream_centrality = avg_downstream_impact * hub_centrality,
+      
+      # Network-Weighted Delay as normalized composite
+      network_weighted_delay = min_max(expected_value_delay) * min_max(downstream_centrality),
+      
+      # Systemic Risk Score
+      systemic_risk_score = sqrt(expected_variance_delay) * avg_downstream_impact
+    ) |>
+    arrange(desc(network_weighted_delay))
+  
+  return(network_risk)
+}
+
+# Execute the final analytical framework
+final_thesis_metrics <- calculate_network_weighted_risk(final_formatted, theoretical_results)
+```
+
+The theoretical queuing metrics reveal local congestion risk, but aviation operates in an interconnected network where delays propagate beyond a single airport. To address this dimension, two layers are added to the baseline delay estimates.
+
+First, it quantifies downstream potential, $D$, at each airport i, since a delayed aircraft early in its daily rotation cascades disruption across all following segments. The metric captures this by counting the remaining flights in each aircraft's daily schedule at the moment of departure.
+
+Second, it uses PageRank centrality to identify hub airports whose connectivity, $C$, makes them transmission centers for network-wide instability. The weights on the graph edges are based on the volume of flights between these airports. This metric allows for the delays at larger hubs to be weighed more heavily, since delays have fundamentally different consequences to other movements than at a small regional airport.
+
+The synthesis of these metrics produces a network-weighted delay and systemic risk score. Network-weighted delay normalizes and combines local expected delay with downstream impact, thereby identifying airports that pose threats to schedule integrity based on both their congestion and network position.
+
+$$
+\mathrm{NWD}_i = 
+\widetilde{\mathbb{E}[W_{q,i}]} \cdot 
+\widetilde{(D_i \cdot C_i)}
+$$
+
+The systemic risk score multiplies the standard deviation of queuing delay by downstream impact to highlight airports with high delay volatility that may easily expose knock-on effects.
+
+$$
+\mathrm{SRS}_i = \sqrt{\mathbb{V}[W_{q,i}]} \cdot D_i
+$$
+
+\pagebreak
+
+## Results
+
+The created metrics have relatively low correlation with each other, which makes them all very helpful for understanding the nodes (airports) in different ways.
+
+```{r fig-7, fig.cap="Correlation Matrix of Created Risk Metrics"}
+
+correlation_data <- final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 70) |>
+  dplyr::select(rho, expected_delay = expected_value_delay, 
+                fragility = fragility_index, downstream = avg_downstream_impact,
+                centrality = hub_centrality, network_wtd = network_weighted_delay,
+                systemic = systemic_risk_score) |>
+  tidyr::drop_na()
+
+cor_matrix <- cor(correlation_data, use = "pairwise.complete.obs")
+
+# Melt the correlation matrix
+melted_cor <- melt(cor_matrix)
+
+# Create the heatmap
+ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#6D9EC1", high = "#E46726", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name = "Correlation") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5)) +
+  coord_fixed()
+```
+
+The following section presents tables of airport rankings based on the metrics calculated by this simulation. For the results, a top-60 cutoff by weekly flight volume was selected to include my home airport, Bradley International Airport (ICAO: KBDL) in Hartford, Connecticut.
+
+```{r centrality-table, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  dplyr::select(
+    Airport = departure,
+    `Weekly Flights` = weekly_flights,
+    `Hub Centrality` = hub_centrality
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(`Hub Centrality`)) |>
+  slice_head(n = 10) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Airports by Network Centrality (PageRank)"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+The most influential airports in the network were identified using PageRank centrality, a classic network analysis index. The Hub Centrality scores are normalized to a mean of 1.0, and scale linearly (e.g., a score of 2.5 means that the airport is 150% more central than average). Unsurprisingly, the largest hub airports in the United States are the leaders of this index.
+
+```{r exp-value-delay-table, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  dplyr::select(Airport = departure, 
+                `Expected Value Delay` = expected_value_delay,
+                `Utilization` = rho) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(`Expected Value Delay`)) |>
+  slice_head(n = 10) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Airports by Expected Queuing Delay (Among 60 Busiest)"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+The theoretical expected queuing delay is derived from M/G/1 queuing and the Pollaczek-Khinchine formula. The Expected Value Delay represents the average additional waiting time flights experience beyond their scheduled slot due to capacity constraints and demand fluctuations. These airports are very different from the mega-hubs above; instead, they are all relatively small spokes.
+
+```{r fragile-table, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  dplyr::select(
+    Airport = departure,
+    `Fragility Index` = fragility_index,
+    `Expected Delay` = expected_value_delay,
+    `Delay Variance` = expected_variance_delay,
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(`Fragility Index`)) |>
+  slice_head(n = 10) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Most Fragile Airports by Variance-to-Mean Ratio (Among 60 Busiest)"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+The fragility identifies airports where delay variability is disproportionately high relative to average delay. High fragility indicates that these airports may function adequately under typical conditions but experience explosive delay growth in response to minor utilization swings. Airports can appear fragile through different mechanisms: either extremely high variance from near-capacity operations (not the case with these relatively large airports) or moderate variance combined with very low baseline delays. This metric can show which airports require buffer capacity or demand management.
+
+```{r avg-downstream-table, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  dplyr::select(Airport = departure, 
+                `Expected Value Delay` = expected_value_delay,
+                `Avg Downstream Impact` = avg_downstream_impact, 
+                `Network Weighted Delay` = network_weighted_delay) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(`Avg Downstream Impact`)) |>
+  slice_head(n = 10) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Airports by Average Downstream Impact (Among 60 Busiest)"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+The downstream impact quantifies how many subsequent flights in an aircraft's daily rotation depend on each departing flight. High downstream-impact airports are those where aircraft tend to be early in their flights, so a delay can cascade through multiple subsequent segments. Airports serving as overnight bases or morning departure hubs naturally rank high because aircraft leave with full days of flying ahead. The comparison with the Expected Value Delay shows whether high-impact airports also experience local congestion.
+
+```{r network-weighted-table, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+final_thesis_metrics |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  dplyr::select(
+    Airport = departure,
+    `Network Weighted Delay` = network_weighted_delay,
+    `Expected Value Delay` = expected_value_delay,
+    `Avg Downstream Impact` = avg_downstream_impact,
+    `Hub Centrality` = hub_centrality
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(`Network Weighted Delay`)) |>
+  slice_head(n = 20) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Airports by Network-Weighted Delay (Among 60 Busiest)"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+The composite metric Network Weighted Delay combines local congestion risk with a normalization of downstream propagation and centrality weighting. The ranking represents the most holistic assessment of which airports, when considering their internal delay and network amplification effects together. The normalization process ensures that both components contribute meaningfully regardless of their original scales. Airports at the top of this ranking are prime candidates for airlines to reconsider their strategies, since improvements here yield disproportionate network-wide benefits.
+
+```{r delay-sensitivity-scenario}
+
+scenarios <- list(
+  
+  baseline = list(
+    name = "Baseline",
+    delays = list(
+      carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+      nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+      weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+    ),
+    capacity_multiplier = 1.0,
+    turnaround = list(shape = shape_hat, rate = rate_hat)
+  ),
+  
+  high_carrier_delays = list(
+    name = "High Carrier Delays",
+    delays = list(
+      carrier = list(prob = 0.15, meanlog = 3.0, sdlog = 1.0),  # Increased
+      nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+      weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+    ),
+    capacity_multiplier = 1.0,
+    turnaround = list(shape = shape_hat, rate = rate_hat)
+  ),
+  
+  severe_weather = list(
+    name = "Severe Weather",
+    delays = list(
+      carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+      nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+      weather = list(prob = 0.12, shape = 2.5, rate = 0.04)  # More frequent & severe
+    ),
+    capacity_multiplier = 1.0,
+    turnaround = list(shape = shape_hat, rate = rate_hat)
+  ),
+  
+  nas_congestion = list(
+    name = "NAS Congestion",
+    delays = list(
+      carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+      nas = list(prob = 0.12, shape = 3.0, rate = 0.08),  # More NAS delays
+      weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+    ),
+    capacity_multiplier = 1.0,
+    turnaround = list(shape = shape_hat, rate = rate_hat)
+  ),
+  
+  reduced_capacity = list(
+    name = "Reduced Capacity (-20%)",
+    delays = list(
+      carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+      nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+      weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+    ),
+    capacity_multiplier = 0.8,  # 20% capacity reduction
+    turnaround = list(shape = shape_hat, rate = rate_hat)
+  ),
+  
+  slow_turnaround = list(
+    name = "Slow Turnaround",
+    delays = list(
+      carrier = list(prob = 0.08, meanlog = 2.5, sdlog = 0.8),
+      nas = list(prob = 0.05, shape = 2.0, rate = 0.1),
+      weather = list(prob = 0.03, shape = 1.5, rate = 0.05)
+    ),
+    capacity_multiplier = 1.0,
+    turnaround = list(shape = shape_hat * 1.3, rate = rate_hat * 0.9)  # Slower
+  ),
+  
+  compound_stress = list(
+    name = "Compound Stress",
+    delays = list(
+      carrier = list(prob = 0.12, meanlog = 2.8, sdlog = 0.9),
+      nas = list(prob = 0.08, shape = 2.5, rate = 0.09),
+      weather = list(prob = 0.06, shape = 2.0, rate = 0.045)
+    ),
+    capacity_multiplier = 0.85,  # 15% capacity reduction
+    turnaround = list(shape = shape_hat * 1.2, rate = rate_hat * 0.95)
+  ),
+  
+  optimistic = list(
+    name = "Optimistic",
+    delays = list(
+      carrier = list(prob = 0.05, meanlog = 2.0, sdlog = 0.6),
+      nas = list(prob = 0.03, shape = 1.5, rate = 0.12),
+      weather = list(prob = 0.02, shape = 1.2, rate = 0.06)
+    ),
+    capacity_multiplier = 1.1,  # 10% capacity increase
+    turnaround = list(shape = shape_hat * 0.9, rate = rate_hat * 1.1)
+  )
+)
+
+run_scenario_simulation <- function(schedule, airport_info_base, scenario_config, seed = 115) {
+  
+  # Adjust airport capacities based on scenario
+  airport_info <- airport_info_base |>
+    mutate(
+      capacity_per_hour = capacity_per_hour * scenario_config$capacity_multiplier
+    )
+  
+  # Generate delays based on scenario parameters
+  n <- nrow(schedule)
+  
+  carrier_delays <- generate_carrier_delay_custom(
+    n,
+    prob = scenario_config$delays$carrier$prob,
+    meanlog = scenario_config$delays$carrier$meanlog,
+    sdlog = scenario_config$delays$carrier$sdlog
+  )
+  
+  nas_delays <- generate_nas_delay_custom(
+    n,
+    prob = scenario_config$delays$nas$prob,
+    shape = scenario_config$delays$nas$shape,
+    rate = scenario_config$delays$nas$rate
+  )
+  
+  weather_delays <- generate_weather_delay_custom(
+    n,
+    prob = scenario_config$delays$weather$prob,
+    shape = scenario_config$delays$weather$shape,
+    rate = scenario_config$delays$weather$rate
+  )
+  
+  # Calculate total delay and affected flights
+  total_delay <- carrier_delays + nas_delays + weather_delays
+  affected_flights <- sum(total_delay > 0)
+  
+  # Calculate theoretical risk with adjusted capacity
+  theoretical_risk <- calculate_theoretical_airport_risk(schedule, airport_info)
+  
+  # Calculate network risk
+  network_risk <- calculate_network_weighted_risk(schedule, theoretical_risk)
+  
+  # Summary metrics
+  list(
+    scenario = scenario_config$name,
+    total_system_delay = sum(total_delay),
+    affected_flights = affected_flights,
+    pct_affected = affected_flights / n * 100,
+    mean_delay_all = mean(total_delay),
+    mean_delay_affected = mean(total_delay[total_delay > 0]),
+    median_delay_affected = median(total_delay[total_delay > 0]),
+    p95_delay = quantile(total_delay, 0.95),
+    p99_delay = quantile(total_delay, 0.99),
+    carrier_contribution = sum(carrier_delays) / sum(total_delay) * 100,
+    nas_contribution = sum(nas_delays) / sum(total_delay) * 100,
+    weather_contribution = sum(weather_delays) / sum(total_delay) * 100,
+    avg_utilization = mean(theoretical_risk$rho, na.rm = TRUE),
+    max_utilization = max(theoretical_risk$rho, na.rm = TRUE),
+    avg_expected_delay = mean(theoretical_risk$expected_value_delay, na.rm = TRUE),
+    avg_fragility = mean(theoretical_risk$fragility_index, na.rm = TRUE),
+    network_risk = network_risk,
+    theoretical_risk = theoretical_risk
+  )
+}
+
+# Custom delay generators that accept parameters
+generate_carrier_delay_custom <- function(n, prob, meanlog, sdlog) {
+  delays <- rep(0, n)
+  affected <- runif(n) < prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rlnorm(sum(affected), meanlog = meanlog, sdlog = sdlog)
+  }
+  pmin(round(delays), 180)
+}
+
+generate_nas_delay_custom <- function(n, prob, shape, rate) {
+  delays <- rep(0, n)
+  affected <- runif(n) < prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rgamma(sum(affected), shape = shape, rate = rate)
+  }
+  pmin(round(delays), 180)
+}
+
+generate_weather_delay_custom <- function(n, prob, shape, rate) {
+  delays <- rep(0, n)
+  affected <- runif(n) < prob
+  if (sum(affected) > 0) {
+    delays[affected] <- rgamma(sum(affected), shape = shape, rate = rate)
+  }
+  pmin(round(delays), 180)
+}
+
+set.seed(115)
+scenario_results <- map_dfr(scenarios, function(scenario) {
+  result <- run_scenario_simulation(final_formatted, airport_info, scenario)
+  
+  tibble(
+    Scenario = result$scenario,
+    `Total Delay (min)` = result$total_system_delay,
+    `Flights Affected (%)` = result$pct_affected,
+    `Mean Delay (affected)` = result$mean_delay_affected,
+    `P95 Delay` = result$p95_delay,
+    `P99 Delay` = result$p99_delay,
+    `Avg ρ` = result$avg_utilization,
+    `Max ρ` = result$max_utilization,
+    `Avg E[Delay]` = result$avg_expected_delay,
+    `Avg Fragility` = result$avg_fragility
+  )
+})
+```
+
+```{r scenario-overview, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+baseline_total_delay <- scenario_results |>
+  filter(Scenario == "Baseline") |>
+  pull(`Total Delay (min)`)
+
+table1 <- scenario_results |>
+  select(
+    Scenario,
+    `Total Delay (min)`,
+    `Flights Affected (%)`,
+    `Mean Delay (affected)`
+  )
+
+table2 <- scenario_results |>
+  mutate(
+    `Delay Change (%)` = (`Total Delay (min)` - baseline_total_delay) / baseline_total_delay * 100,
+    `Delay Multiplier` = `Total Delay (min)` / baseline_total_delay
+  ) |>
+  select(
+    Scenario,
+    `P95 Delay`,
+    `P99 Delay`,
+    `Delay Multiplier`,
+    `Avg E[Delay]`,
+    `Avg Fragility`
+  )
+
+table1 |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "System-Wide Risk Metrics"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position"))
+
+table2 |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "System-Wide Risk Metrics"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position"))
+```
+
+The metrics from eight operational scenarios, ranging from optimistic conditions to compound stress, are shown, each varying the aforementioned delay distributions. Some scenarios only isolate specific delay factors, while other compounding scenarios demonstrate how multiple simultaneous pressures create nonlinear effects. The metrics span multiple dimensions, from overall flight delays to more granular details about the upper end of delays, and the utilization and queuing behavior under each scenario.
+
+```{r delay-source-breakdown, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+delay_source_results <- map_dfr(scenarios, function(scenario) {
+  result <- run_scenario_simulation(final_formatted, airport_info, scenario)
+  
+  tibble(
+    Scenario = result$scenario,
+    `Carrier (%)` = result$carrier_contribution,
+    `NAS (%)` = result$nas_contribution,
+    `Weather (%)` = result$weather_contribution,
+    `Total Delay` = result$total_system_delay
+  )
+})
+
+delay_source_results |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delay Source Contribution by Scenario"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+Total delays across the scenarios were broken down into their sources: carrier operations (i.e., maintenance, crew, airline decisions), National Airspace System congestion (i.e., air traffic control, routing), and weather. The percentage breakdowns reveal how different scenarios shift the relative importance of delay mechanisms.
+
+```{r baseline-stress-comparison, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+baseline_result <- run_scenario_simulation(final_formatted, airport_info, scenarios$baseline)
+stress_result <- run_scenario_simulation(final_formatted, airport_info, scenarios$compound_stress)
+
+airport_comparison <- baseline_result$network_risk |>
+  slice_max(order_by = weekly_flights, n = 60) |>
+  arrange(desc(network_weighted_delay)) |>
+  slice_head(n = 10) |>
+  select(Airport = departure, 
+         `Baseline E[Delay]` = expected_value_delay
+         ) |>
+  left_join(
+    stress_result$network_risk |>
+      select(departure, 
+             `Stress E[Delay]` = expected_value_delay
+             ),
+    by = c("Airport" = "departure")
+  ) |>
+  mutate(
+    `E[Delay] Change (%)` = (`Stress E[Delay]` - `Baseline E[Delay]`) / `Baseline E[Delay]` * 100,
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+airport_comparison |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Top 10 Airports: Baseline vs Compound Stress Scenario"
+  ) |>
+  kableExtra::kable_styling(
+    latex_options = c("hold_position", "repeat_header"),
+    font_size = 9
+  )
+```
+
+This analysis compares airports between normal operations and extreme stress. Airports with large percentage increases demonstrate fragility, and potential;y their queuing dynamics exhibit nonlinear behavior with utilization increases triggering exponential delay growth.
+
+```{r hub-class-comparison, results = 'asis'}
+cat("\\clearpage\n")
+cat("\\thispagestyle{empty}\n")
+
+hub_class_comparison <- map_dfr(c("baseline", "compound_stress", "reduced_capacity"), function(scenario_name) {
+  result <- run_scenario_simulation(final_formatted, airport_info, scenarios[[scenario_name]])
+
+  result$theoretical_risk |>
+    mutate(hub_class = case_when(
+      hub_class == "non_hub" ~ "Non Hub",
+      hub_class == "small_hub" ~ "Small Hub",
+      hub_class == "medium_hub" ~ "Medium Hub",
+      hub_class == "large_hub" ~ "Large Hub",
+      TRUE ~ hub_class
+    )) |>
+    group_by(hub_class) |>
+    summarise(
+      `Mean Utilization` = mean(rho, na.rm = TRUE),
+      `Mean E[Delay]` = mean(expected_value_delay, na.rm = TRUE),
+      `Mean Fragility` = mean(fragility_index, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(Scenario = scenarios[[scenario_name]]$name) |>
+    dplyr::select(Scenario, `Hub Class` = hub_class, everything())
+})
+
+hub_class_comparison |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(`Hub Class`, Scenario) |>
+  knitr::kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Hub Class Performance Across Key Scenarios"
+  ) |>
+  kableExtra::kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+Airports of different sizes respond differently to operational stress, with varying levels of capacity influencing fragility. This cross-scenario comparison shows how the hub class hierarchy remains stable under stress scenarios and can inform resource allocation decisions.
+
+\pagebreak
+
+## Conclusion
+
+This analysis demonstrates that open-source aviation data, while creating research transparency and reproducibility, presents pre-processing challenges. The OpenSky Network’s data is now more usable for future work after gaining experience with what it offers, and the frameworks here could serve as a baseline for other cleaning of this open-source data.
+
+Network theory reveals an asymmetry in how airports may contribute to system performance: either propagating delays downstream through aircraft rotations or absorbing them with a schedule buffer. However, the network-weighted metrics demonstrate that local congestion severity does not directly translate to systemic importance. Instead, airports rank highly when they are both capacity-constrained (experiencing high local queuing delay) and deeply embedded in the network (exhibiting a high number of downstream flights and PageRank centrality), meaning disruptions at these hubs generate disproportionately large system-wide delays. Smaller regional airports may exhibit higher utilization and longer queuing delays due to limited infrastructure, yet their peripheral position in the network contains disruptions locally. In contrast, major hubs operating at low utilization levels can absorb local delays without them spreading far beyond.
+
+This analysis exposes the central paradox of hub-and-spoke aviation networks: the very feature that enables efficient connectivity—with high traffic at strategically positioned hubs over concentrated time periods—simultaneously creates a systemic vulnerability. Under normal operations, they optimize aircraft utilization, maximize connections, and generate the network economies and economies of scale that make modern air travel viable. Understanding which airports sit at the junction of high local fragility and network centrality provides a data-driven foundation for infrastructure investments and schedule pattern adjustments that can protect the network even when individual nodes experience stress.
+
+Further, different operational scenarios illustrate how delay dynamics shift as the system’s delays change scenarios. Under baseline scenarios, delays are relatively balanced across carrier operations, NAS constraints, and weather. However, as stressors are introduced, these factors interact to produce nonlinear increases in total delay, showing that disruptions are interdependent rather than additive.
+
+\pagebreak
+
+## References
