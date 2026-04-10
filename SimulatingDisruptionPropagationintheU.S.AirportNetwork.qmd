@@ -1749,12 +1749,10 @@ $$
 
 $$
 \mathrm{Var}(W_q) = 
-\frac{\lambda}{3\mu^{3}(1 - \rho)} 
+\frac{\lambda}{3\mu^{3}(1 - \rho)} `  
 + 
 \frac{\lambda^2 ({E}[S^2])^2}{4(1 - \rho)^2}
 $$
-
-The variance calculation includes a section that accounts for the randomness in service times and the compounding effect of utilization, with airports operating closer to capacity experiencing exponentially higher delay variance.
 
 This leads to the fragility measure for each airport 𝑖, which compares the standard deviation to the mean delay to identify airports where small movements in demand or capacity can trigger relatively large delays.
 
@@ -2377,5 +2375,9 @@ This analysis exposes the central paradox of hub-and-spoke aviation networks: th
 Further, different operational scenarios illustrate how delay dynamics shift as the system’s delays change scenarios. Under baseline scenarios, delays are relatively balanced across carrier operations, NAS constraints, and weather. However, as stressors are introduced, these factors interact to produce nonlinear increases in total delay, showing that disruptions are interdependent rather than additive.
 
 \pagebreak
+
+## Appendix
+
+The code used for The Opensky Network Trino pull and for the analysis and rendering of this document can be found at [this repository](https://github.com/asapru1315/thesis).
 
 ## References

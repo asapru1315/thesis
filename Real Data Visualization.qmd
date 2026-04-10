@@ -1,0 +1,114 @@
+---
+title: "Visualize Real Flights"
+format: html
+editor: visual
+---
+
+```{r message = FALSE}
+
+library(tidyverse)
+library(airportr)
+library(gganimate)
+library(ggimage)
+library(maps)
+library(gifski)
+library(geosphere)
+library(httr)
+library(jsonlite)
+library(fuzzyjoin)
+```
+
+```{r message = FALSE}
+
+flights <- read_csv("flights_oct2324-2025.csv")
+```
+
+```{r}
+
+interp_two_points <- function(start_row, end_row, interval = "10 min") {
+  seq_time <- seq(start_row$time, end_row$time, by = interval)
+  tibble(
+    time = seq_time,
+    lat = approx(
+      x = c(start_row$time, end_row$time),
+      y = c(start_row$lat, end_row$lat),
+      xout = seq_time
+    )$y,
+    lon = approx(
+      x = c(start_row$time, end_row$time),
+      y = c(start_row$lon, end_row$lon),
+      xout = seq_time
+    )$y
+  )
+}
+```
+
+```{r}
+
+flight_locations <- flights |>
+  arrange(tail_num, dep_time) |>
+  mutate(flight_time = arr_time - dep_time) |>
+  ungroup() |>
+  left_join(airportr::airports |>
+              select(IATA, origin_lat = Latitude, origin_lon = Longitude),
+            by = c("origin" = "IATA")) |>
+  left_join(airportr::airports |>
+              select(IATA, dest_lat = Latitude, dest_lon = Longitude),
+            by = c("destination" = "IATA")) |>
+  group_by(tail_num) |>
+  mutate(next_dep = lead(dep_time)) |>
+  rowwise() |>
+  select(tail_num, dep_time, arr_time, origin_lat, origin_lon, dest_lat, dest_lon) |>
+  pivot_longer(
+    cols = c(dep_time, arr_time),
+    names_to = "event_type",
+    names_pattern = "(dep|arr)_time",
+    values_to = "time"
+  ) %>%
+  mutate(
+    lat = if_else(event_type == "dep", origin_lat, dest_lat),
+    lon = if_else(event_type == "dep", origin_lon, dest_lon)
+  ) |>
+  select(tail_num, time, lat, lon) |>
+  group_by(tail_num) |>
+  mutate(flight_id = ceiling(row_number() / 2)) |> 
+  group_by(tail_num, flight_id) |>
+  group_modify(~{
+    if (nrow(.x) == 2) {
+      interp_two_points(.x[1, ], .x[2, ], interval = "10 min")
+    } 
+    else {
+      NULL
+    }
+  }) |>
+  ungroup() |>
+  mutate(time = round_date(time, "5 minutes"))
+
+flight_locations
+```
+
+```{r}
+
+usa <- map_data("state")
+
+# flights$img <- "https://upload.wikimedia.org/wikipedia/commons/5/56/Avion_silhouette.png"
+
+p <- ggplot() +
+  geom_polygon(data = usa, aes(x = long, y = lat, group = group), fill = "gray90", 
+               color = "white") +
+  geom_path(data = flight_locations, aes(x = lon, y = lat, group = tail_num)) +
+  geom_point(data = flight_locations, aes(x = lon, y = lat), size = 1) +
+  # geom_image(data = flights, aes(x = longitude, y = latitude, image = img, 
+  #                                angle = heading), size = 0.05) +
+  theme_minimal() +
+  coord_fixed(1.3, xlim = c(-125, -70), ylim = c(25, 50)) +
+  labs(
+    title = 'Flights: USA',
+    subtitle = 'Time: {frame_time}',
+    x = 'Longitude', y = 'Latitude'
+  ) +
+  ease_aes('linear') +
+  transition_time(time)
+
+animate(p, fps = 4, duration = 23)
+```
